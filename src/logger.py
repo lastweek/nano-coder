@@ -1,38 +1,64 @@
 """Chat completion logging for Nano-Coder."""
 
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from threading import Lock
+from threading import Lock, Thread
+from queue import Queue
+from src.config import config
 
 
 class ChatLogger:
     """Logs chat completions and tool executions to JSONL files."""
 
-    def __init__(self, session_id: str, log_dir: str = "logs", enabled: bool = True, buffer_size: int = 10):
+    def __init__(self, session_id: str, log_dir: Optional[str] = None, enabled: Optional[bool] = None, buffer_size: Optional[int] = None, async_mode: Optional[bool] = None):
         """Initialize the logger.
 
         Args:
             session_id: Unique session identifier
-            log_dir: Directory to store log files
-            enabled: Whether logging is enabled
-            buffer_size: Number of log entries to buffer before flushing (default: 10)
+            log_dir: Directory to store log files (defaults to config.logging.log_dir)
+            enabled: Whether logging is enabled (defaults to config.logging.enabled)
+            buffer_size: Number of log entries to buffer before flushing (defaults to config.logging.buffer_size)
+            async_mode: If True, use background thread for non-blocking logging (defaults to config.logging.async_mode)
         """
         self.session_id = session_id
+
+        # Use config defaults if not specified
+        if log_dir is None:
+            log_dir = config.logging.log_dir
+        if enabled is None:
+            # Check env var directly for backward compatibility
+            import os
+            env_value = os.environ.get("ENABLE_LOGGING", "").lower()
+            if env_value == "false":
+                enabled = False
+            elif env_value == "true":
+                enabled = True
+            else:
+                enabled = config.logging.enabled
+        if buffer_size is None:
+            buffer_size = config.logging.buffer_size
+        if async_mode is None:
+            async_mode = config.logging.async_mode
+
         self.log_dir = Path(log_dir)
-        # Check ENABLE_LOGGING env var, default to true
-        if enabled and os.environ.get("ENABLE_LOGGING", "true").lower() != "true":
-            enabled = False
         self.enabled = enabled
+        self.async_mode = async_mode
+
         self._lock = Lock()
         self._file = None
         self._buffer = []
         self._buffer_size = buffer_size
 
-        if self.enabled:
-            self._open_log_file()
+        # Async mode: queue and writer thread
+        self._queue = None
+        self._writer_thread = None
+        self._stop_requested = False
+
+        if self.enabled and self.async_mode:
+            self._queue = Queue()
+            self._start_writer_thread()
 
     def _open_log_file(self):
         """Open/create the log file for this session."""
@@ -53,13 +79,36 @@ class ChatLogger:
             # Symlinks may not work on all systems, skip if fails
             pass
 
-    def log(self, entry: Dict[str, Any]) -> None:
-        """Write a log entry to the file.
+    def _ensure_file_open(self) -> None:
+        """Open log file on first write (lazy initialization)."""
+        if self.enabled and self._file is None:
+            self._open_log_file()
 
-        Args:
-            entry: Dictionary containing log data
-        """
-        if not self.enabled or self._file is None:
+    def _start_writer_thread(self):
+        """Start background thread for async logging."""
+        def writer():
+            while not self._stop_requested:
+                try:
+                    # Get entry with timeout to allow checking stop_requested
+                    entry = self._queue.get(timeout=0.1)
+                    if entry is None:  # Poison pill
+                        break
+                    self._ensure_file_open()
+                    self._write_entry(entry)
+                except:
+                    continue  # Timeout or empty queue, continue loop
+
+        self._writer_thread = Thread(target=writer, daemon=True)
+        self._writer_thread.start()
+
+    def _write_entry(self, entry: Dict[str, Any]) -> None:
+        """Write a single log entry (called by sync or async mode)."""
+        if not self.enabled:
+            return
+
+        self._ensure_file_open()
+
+        if self._file is None:
             return
 
         with self._lock:
@@ -70,6 +119,24 @@ class ChatLogger:
             # Flush when buffer reaches threshold
             if len(self._buffer) >= self._buffer_size:
                 self._flush_buffer()
+
+    def log(self, entry: Dict[str, Any]) -> None:
+        """Write a log entry to the file.
+
+        Args:
+            entry: Dictionary containing log data
+        """
+        if not self.enabled:
+            return
+
+        self._ensure_file_open()
+
+        if self.async_mode:
+            # Non-blocking: queue for background thread
+            self._queue.put(entry)
+        else:
+            # Blocking: write immediately
+            self._write_entry(entry)
 
     def _flush_buffer(self) -> None:
         """Flush the buffer to file."""
@@ -133,7 +200,16 @@ class ChatLogger:
         self.log(entry)
 
     def close(self) -> None:
-        """Close the log file."""
+        """Close the log file and cleanup resources."""
+        # Stop writer thread if in async mode
+        if self.async_mode and self._writer_thread:
+            self._stop_requested = True
+            # Send poison pill to unblock the thread
+            self._queue.put(None)
+            # Wait for thread to finish (with timeout)
+            self._writer_thread.join(timeout=1.0)
+            self._writer_thread = None
+
         if self._file:
             with self._lock:
                 # Flush any remaining entries

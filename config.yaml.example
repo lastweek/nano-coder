@@ -1,0 +1,21 @@
+# Nano-Coder Configuration
+# This file is loaded by src/config.py
+# Environment variables can override these values
+
+llm:
+  provider: custom  # openai, azure, ollama, custom
+  model: your-model-name
+  base_url: https://api.example.com/v1
+
+logging:
+  enabled: true
+  async_mode: false
+  log_dir: logs
+  buffer_size: 1
+
+agent:
+  max_iterations: 10
+
+ui:
+  enable_streaming: true
+  loading_indicator_interval: 0.8

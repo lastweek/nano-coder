@@ -109,6 +109,36 @@ Logs are saved in JSONL format (one JSON object per line) in the `logs/` directo
 
 Set `ENABLE_LOGGING=false` in your `.env` file to disable logging.
 
+## Streaming Output
+
+Nano-Coder supports streaming output for real-time token-by-token response display, similar to ChatGPT.
+
+### Enabling Streaming
+
+Streaming is enabled by default. To disable it:
+
+```bash
+# In your .env file
+ENABLE_STREAMING=false
+```
+
+### How Streaming Works
+
+When `ENABLE_STREAMING=true`:
+- LLM responses appear token-by-token as they're generated
+- You see the response in real-time instead of waiting for the complete message
+- Tool executions still display normally during streaming
+
+When `ENABLE_STREAMING=false`:
+- A "Thinking..." indicator shows while waiting for the LLM
+- The complete response appears at once when finished
+
+### Performance
+
+Streaming provides better perceived performance (instant feedback) but requires:
+- OpenAI-compatible API that supports streaming (most do)
+- Slightly more CPU for real-time rendering
+
 ## Usage
 
 ```bash

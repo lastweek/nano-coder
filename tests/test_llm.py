@@ -1,14 +1,34 @@
 """Test LLMClient configuration."""
 
 import pytest
+import importlib
+import sys
 from src.llm import LLMClient
 
 
 class TestLLMClient:
     """Test LLMClient initialization and configuration."""
 
+    def _reload_config_and_modules(self):
+        """Helper to reload config and dependent modules.
+
+        This is needed because config is loaded at import time and cached.
+        When we change env vars in tests, we need to reload to pick up changes.
+        """
+        from src.config import Config
+        import os
+        # Enable test mode to skip loading config.yaml
+        os.environ['NANO_CODER_TEST'] = 'true'
+        Config.reload()
+        # Reload modules that import config
+        if 'src.llm' in sys.modules:
+            importlib.reload(sys.modules['src.llm'])
+        if 'src.logger' in sys.modules:
+            importlib.reload(sys.modules['src.logger'])
+
     def test_openai_provider_with_key(self, monkeypatch):
         """Test OpenAI provider initialization."""
+        self._reload_config_and_modules()
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
         client = LLMClient(provider="openai")
         assert client.provider == "openai"
@@ -18,27 +38,31 @@ class TestLLMClient:
     def test_custom_provider_with_base_url(self, monkeypatch):
         """Test custom provider with base URL."""
         monkeypatch.setenv("CUSTOM_API_KEY", "test-key")
-        monkeypatch.setenv("BASE_URL", "https://api.test.com/v1")
+        monkeypatch.setenv("LLM_BASE_URL", "https://api.test.com/v1")
+        self._reload_config_and_modules()
         client = LLMClient(provider="custom")
         assert client.provider == "custom"
         assert client.client is not None
 
     def test_ollama_provider_no_api_key(self, monkeypatch):
         """Test Ollama provider doesn't require API key."""
-        monkeypatch.setenv("BASE_URL", "http://localhost:11434/v1")
+        monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1")
+        self._reload_config_and_modules()
         client = LLMClient(provider="ollama")
         assert client.provider == "ollama"
         assert client.model == "llama2"
 
     def test_default_base_url_for_ollama(self, monkeypatch):
         """Test Ollama gets default base URL."""
-        monkeypatch.setenv("BASE_URL", "")  # Empty
+        monkeypatch.setenv("LLM_BASE_URL", "")  # Empty
+        self._reload_config_and_modules()
         client = LLMClient(provider="ollama")
         # Client should be initialized with default Ollama URL
         assert client.provider == "ollama"
 
     def test_missing_api_key_raises_error(self, monkeypatch):
         """Test that missing API key raises ValueError."""
+        self._reload_config_and_modules()
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         with pytest.raises(ValueError, match="API key required"):
             LLMClient(provider="openai")
@@ -46,7 +70,8 @@ class TestLLMClient:
     def test_model_from_env(self, monkeypatch):
         """Test model can be set from environment."""
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        monkeypatch.setenv("MODEL", "gpt-3.5-turbo")
+        monkeypatch.setenv("LLM_MODEL", "gpt-3.5-turbo")
+        self._reload_config_and_modules()
         client = LLMClient(provider="openai")
         assert client.model == "gpt-3.5-turbo"
 

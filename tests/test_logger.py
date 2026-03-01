@@ -12,14 +12,24 @@ class TestChatLogger:
     """Test ChatLogger functionality."""
 
     def test_creates_log_file(self, temp_dir):
-        """Test that logger creates log file."""
+        """Test that logger creates log file only when logging occurs."""
         session_id = str(uuid.uuid4())
+
+        # Test 1: No file should be created without any logging
         logger = ChatLogger(session_id, log_dir=str(temp_dir), enabled=True)
         logger.close()
 
-        # Filter out the symlink, count only actual session files
         log_files = [f for f in Path(temp_dir).glob("*.jsonl") if f.name != "latest.jsonl"]
-        assert len(log_files) == 1
+        assert len(log_files) == 0  # No files created when no logging occurs
+
+        # Test 2: File should be created when actual logging occurs
+        logger2 = ChatLogger(session_id, log_dir=str(temp_dir), enabled=True)
+        logger2.log_user_message("test message")
+        logger2.close()
+
+        log_files = [f for f in Path(temp_dir).glob("*.jsonl") if f.name != "latest.jsonl"]
+        assert len(log_files) == 1  # File created after logging
+        assert log_files[0].stat().st_size > 0  # File has content
         # Verify latest.jsonl symlink exists
         assert (Path(temp_dir) / "latest.jsonl").exists()
 

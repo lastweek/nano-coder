@@ -13,6 +13,7 @@ if __name__ == "__main__" and __file__:
 
 from dotenv import load_dotenv
 from rich.console import Console
+from src.input_helper import InputHelper
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
@@ -44,9 +45,31 @@ REQUEST_TYPE_NON_STREAMING = "non-streaming"
 
 def print_banner(console: Console) -> None:
     """Print welcome banner."""
+    from src.config import config
+
+    # Build LLM info lines
+    llm_info_lines = []
+    if config.llm.base_url:
+        llm_info_lines.append(Text(f"URL: {config.llm.base_url}", style="dim"))
+    if config.llm.model:
+        model_text = Text(f"Model: {config.llm.model}", style="dim")
+        if config.llm.context_window:
+            model_text.append(Text(f" (context: {config.llm.context_window:,} tokens)", style="dim"))
+        llm_info_lines.append(model_text)
+    if config.llm.provider:
+        llm_info_lines.append(Text(f"Provider: {config.llm.provider}", style="dim"))
+
+    # Build panel content
+    panel_content = Text("Nano-Coder", style="bold cyan") + "\n" + \
+                    Text("Minimalism Terminal Code Agent", style="dim")
+
+    # Add LLM info if available
+    if llm_info_lines:
+        panel_content += Text("\n\n")
+        panel_content += Text("\n").join(llm_info_lines)
+
     console.print(Panel(
-        Text("Nano-Coder", style="bold cyan") + "\n" +
-        Text("Minimalism Terminal Code Agent", style="dim"),
+        panel_content,
         border_style="cyan",
         padding=(1, 2)
     ))
@@ -169,7 +192,9 @@ def main() -> None:
     enable_streaming = config.ui.enable_streaming
     provider = config.llm.provider
 
-    console = Console()
+    # Use stderr for Rich output to avoid conflicts with prompt_toolkit using stdout
+    import sys
+    console = Console(stderr=True)
 
     # Check for API key (from config or environment variable)
     # Only check if provider requires it (ollama/local don't)
@@ -205,6 +230,9 @@ def main() -> None:
     # Create agent
     agent = Agent(llm_client, tools, context)
 
+    # Initialize input helper for bash-like editing
+    input_helper = InputHelper()
+
     # Print banner
     print_banner(console)
 
@@ -212,8 +240,12 @@ def main() -> None:
     try:
         while True:
             try:
-                # Get user input
-                user_input = console.input("\n[bold green]You[/bold green] > ")
+                # Get user input with bash-like editing
+                user_input = input_helper.get_input("\nYou > ")
+
+                # CRITICAL: Ensure we're on a fresh line after prompt_toolkit
+                # This fixes the issue where subsequent responses don't display
+                print()
 
                 if not user_input.strip():
                     continue

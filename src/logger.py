@@ -95,8 +95,12 @@ class ChatLogger:
                         break
                     self._ensure_file_open()
                     self._write_entry(entry)
-                except:
+                except (Queue.Empty, TimeoutError):
                     continue  # Timeout or empty queue, continue loop
+                except Exception as e:
+                    # Log unexpected errors but continue running
+                    import logging
+                    logging.warning(f"Writer thread error: {e}")
 
         self._writer_thread = Thread(target=writer, daemon=True)
         self._writer_thread.start()

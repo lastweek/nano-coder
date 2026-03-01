@@ -105,6 +105,29 @@ class LLMClient:
         }
         return defaults.get(provider, "gpt-4")
 
+    def _estimate_prompt_tokens(self, messages: List[Dict]) -> int:
+        """Estimate prompt tokens from messages.
+
+        Uses a rough character-based estimate (char_count / 4) as a fallback
+        when the API doesn't return usage information. This is approximate
+        but sufficient for display purposes.
+
+        Args:
+            messages: List of message dicts with role and content
+
+        Returns:
+            Estimated token count
+        """
+        import json
+
+        # Serialize messages to JSON to get a rough character count
+        # This includes role, content, and JSON structure overhead
+        text = json.dumps(messages)
+
+        # Rough estimate: ~4 characters per token for English text
+        # This is not exact but provides a reasonable approximation
+        return max(1, len(text) // 4)
+
     def _build_chat_kwargs(
         self,
         messages: List[Dict],
@@ -165,6 +188,13 @@ class LLMClient:
             if hasattr(response.usage, 'prompt_tokens_details') and response.usage.prompt_tokens_details:
                 cached = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
                 metrics.cached_tokens = cached or 0
+        else:
+            # Fallback: estimate tokens when API doesn't return usage
+            metrics.prompt_tokens = self._estimate_prompt_tokens(messages)
+            # For non-streaming, we can't accurately count completion tokens without usage
+            # Set them to 0 and let total_tokens be just prompt_tokens
+            metrics.completion_tokens = 0
+            metrics.total_tokens = metrics.prompt_tokens
 
         metrics.finish()
 
@@ -276,11 +306,25 @@ class LLMClient:
             if finish_reason:
                 yield {"finish_reason": finish_reason}
 
-        # Finish tracking
+                # Extract usage from final chunk if available
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    self._current_metrics.prompt_tokens = chunk.usage.prompt_tokens
+                    self._current_metrics.completion_tokens = chunk.usage.completion_tokens
+                    self._current_metrics.total_tokens = chunk.usage.total_tokens
+
+                    # Extract cached tokens if available
+                    if hasattr(chunk.usage, 'prompt_tokens_details') and chunk.usage.prompt_tokens_details:
+                        cached = getattr(chunk.usage.prompt_tokens_details, 'cached_tokens', 0)
+                        self._current_metrics.cached_tokens = cached or 0
+
+        # Always call finish() to record end time, regardless of usage availability
         self._current_metrics.finish()
-        self._current_metrics.completion_tokens = len(self._current_metrics.token_timestamps)
-        # In streaming mode, we only have completion tokens, so total = completion
-        self._current_metrics.total_tokens = self._current_metrics.completion_tokens
+
+        # If no usage info was found in the stream, estimate it
+        if self._current_metrics.prompt_tokens == 0:
+            self._current_metrics.completion_tokens = self._current_metrics.token_count
+            self._current_metrics.prompt_tokens = self._estimate_prompt_tokens(messages)
+            self._current_metrics.total_tokens = self._current_metrics.prompt_tokens + self._current_metrics.completion_tokens
 
         # Log complete response
         tool_calls_list = list(accumulated_tool_calls.values())

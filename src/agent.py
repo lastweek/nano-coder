@@ -70,12 +70,12 @@ Be concise and helpful."""
 
         return messages
 
-    def _execute_tool_call(self, tool_call: Dict, parsed_args: Optional[Dict] = None) -> Dict:
+    def _execute_tool_call(self, tool_call: Dict, parsed_args: Dict) -> Dict:
         """Execute a single tool call.
 
         Args:
             tool_call: Tool call dict with id, name, and arguments
-            parsed_args: Pre-parsed arguments (to avoid duplicate JSON parsing)
+            parsed_args: Pre-parsed tool arguments
 
         Returns:
             Tool result message for LLM
@@ -84,18 +84,12 @@ Be concise and helpful."""
         tool_id = tool_call["id"]
 
         try:
-            # Use pre-parsed args if provided, otherwise parse
-            if parsed_args is None:
-                arguments = json.loads(tool_call["arguments"])
-            else:
-                arguments = parsed_args
-
             # Get tool and execute
             tool = self.tools.get(tool_name)
             if not tool:
                 result = {"error": f"Unknown tool: {tool_name}"}
             else:
-                result_obj = tool.execute(self.context, **arguments)
+                result_obj = tool.execute(self.context, **parsed_args)
                 if result_obj.success:
                     result = {"output": str(result_obj.data)}
                 else:
@@ -228,7 +222,7 @@ Be concise and helpful."""
         # ReAct loop with streaming
         for iteration in range(self.max_iterations):
             # Stream LLM response
-            buffer = ""
+            buffer = []
             current_role = "assistant"
 
             for chunk in self.llm.chat_stream(messages, tools=self._cached_tool_schemas):
@@ -237,7 +231,7 @@ Be concise and helpful."""
 
                 if "delta" in chunk:
                     # Yield content tokens directly
-                    buffer += chunk["delta"]
+                    buffer.append(chunk["delta"])
                     yield chunk["delta"]
 
                 if "tool_calls" in chunk or "finish_reason" in chunk:
@@ -257,14 +251,14 @@ Be concise and helpful."""
 
             if not tool_calls:
                 # No more tool calls, this is the final response
-                final_response = buffer or ""
+                final_response = "".join(buffer) if buffer else ""
                 self._finalize_response(user_message, final_response)
                 return  # End of stream
 
             # We have tool calls - add the streamed content to messages
             messages.append({
                 "role": current_role,
-                "content": buffer
+                "content": "".join(buffer)
             })
 
             # Process each tool call

@@ -66,7 +66,7 @@ class TestLLMMetrics:
         metrics.add_token_timestamp()
 
         assert metrics.tpot >= 0.01
-        assert len(metrics.token_timestamps) == 3
+        assert metrics.token_count == 3
         # TPOT should be roughly total_time / (num_tokens - 1)
         # 3 tokens = 2 intervals, ~0.02s total / 2 = ~0.01s
         assert metrics.tpot < 0.05
@@ -114,7 +114,7 @@ class TestLLMMetrics:
         metrics.add_token_timestamp()
         metrics.add_token_timestamp()
 
-        assert len(metrics.token_timestamps) == 3
+        assert metrics.token_count == 3
 
     def test_metrics_properties(self):
         """Test all computed properties."""

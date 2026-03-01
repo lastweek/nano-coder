@@ -1,7 +1,6 @@
 """Metrics tracking for LLM requests."""
 
 from dataclasses import dataclass, field
-from typing import List
 from time import perf_counter
 
 
@@ -14,8 +13,10 @@ class LLMMetrics:
     end_time: float = 0.0
     ttft: float = 0.0  # Time to first token (seconds)
 
-    # Token timing (for streaming)
-    token_timestamps: List[float] = field(default_factory=list)
+    # Token timing (for streaming) - O(1) storage instead of O(n)
+    first_token_time: float = 0.0
+    last_token_time: float = 0.0
+    token_count: int = 0
 
     # Usage metrics (from OpenAI response)
     prompt_tokens: int = 0
@@ -37,9 +38,11 @@ class LLMMetrics:
     @property
     def tpot(self) -> float:
         """Time per output token (average) in seconds."""
-        if len(self.token_timestamps) < 2:
+        if self.token_count < 2:
             return 0.0
-        return (self.token_timestamps[-1] - self.token_timestamps[0]) / (len(self.token_timestamps) - 1)
+        # Use first_token_time if set, otherwise use start_time as fallback
+        first_time = self.first_token_time if self.first_token_time > 0 else self.start_time
+        return (self.last_token_time - first_time) / (self.token_count - 1)
 
     @property
     def tokens_per_second(self) -> float:
@@ -52,10 +55,12 @@ class LLMMetrics:
         """Mark when first token arrives (for TTFT)."""
         if self.ttft == 0.0:
             self.ttft = perf_counter() - self.start_time
+            self.first_token_time = perf_counter()
 
     def add_token_timestamp(self) -> None:
         """Record timestamp for each token (for TPOT calculation)."""
-        self.token_timestamps.append(perf_counter())
+        self.last_token_time = perf_counter()
+        self.token_count += 1
 
     def finish(self) -> None:
         """Mark the end of the request."""

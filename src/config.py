@@ -22,6 +22,7 @@ class LLMConfig(BaseSettings):
     base_url: Optional[str] = Field(default=None, description="Custom API base URL")
     model: Optional[str] = Field(default=None, description="Model name")
     api_key: Optional[str] = Field(default=None, description="API key (auto-detected from provider)")
+    context_window: Optional[int] = Field(default=None, description="Model context window size (tokens)")
 
     @field_validator("provider")
     @classmethod

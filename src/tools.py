@@ -14,6 +14,10 @@ ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"
 ROLE_TOOL = "tool"
 
+# Constants for request kind tracking
+REQUEST_KIND_AGENT_TURN = "agent_turn"
+REQUEST_KIND_CONTEXT_COMPACTION = "context_compaction"
+
 
 @dataclass
 class ToolResult:

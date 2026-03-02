@@ -12,6 +12,7 @@ from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional
 
 from src.config import config
+from src.tools import REQUEST_KIND_AGENT_TURN, REQUEST_KIND_CONTEXT_COMPACTION
 
 
 SESSION_HEADER_RULE = "=" * 80
@@ -157,6 +158,7 @@ class SessionLogger:
         provider: str,
         model: str,
         stream: bool,
+        request_kind: str = REQUEST_KIND_AGENT_TURN,
     ) -> None:
         """Log an LLM request block to llm.log."""
         if not self.enabled:
@@ -175,6 +177,7 @@ class SessionLogger:
             provider,
             model,
             stream,
+            request_kind,
         )
         self._submit_write(self._write_session_manifest)
 
@@ -187,6 +190,7 @@ class SessionLogger:
         model: str,
         stream: bool,
         metrics: Optional[Dict[str, Any]] = None,
+        request_kind: str = REQUEST_KIND_AGENT_TURN,
     ) -> None:
         """Log an LLM response block to llm.log."""
         if not self.enabled:
@@ -201,7 +205,21 @@ class SessionLogger:
             model,
             stream,
             metrics or {},
+            request_kind,
         )
+
+    def log_context_compaction_event(
+        self,
+        *,
+        turn_id: Optional[int],
+        stage: str,
+        **details: Any,
+    ) -> None:
+        """Log context compaction lifecycle to events.jsonl and llm.log."""
+        if not self.enabled:
+            return
+
+        self._submit_write(self._record_context_compaction_event, turn_id, stage, details)
 
     def log_skill_event(self, turn_id: int, event: str, **details: Any) -> None:
         """Log a skill event to events.jsonl and llm.log."""
@@ -579,20 +597,28 @@ class SessionLogger:
         provider: str,
         model: str,
         stream: bool,
+        request_kind: str,
     ) -> None:
         """Write an LLM request block."""
         self._ensure_initialized()
         timestamp = datetime.now().isoformat()
         timeline_seq = self._next_timeline_seq()
         sections = self._append_json_block("REQUEST JSON", request_payload)
-        self._write_timeline_block(
-            rule=SESSION_HEADER_RULE,
-            header=(
+        if request_kind == REQUEST_KIND_CONTEXT_COMPACTION:
+            header = (
+                f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | "
+                f"CONTEXT COMPACTION REQUEST | STREAM={str(stream).lower()}"
+            )
+        else:
+            header = (
                 f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | "
                 f"LLM REQUEST | STREAM={str(stream).lower()}"
-            ),
+            )
+        self._write_timeline_block(
+            rule=SESSION_HEADER_RULE,
+            header=header,
             timestamp=timestamp,
-            metadata_lines=[f"Provider: {provider}", f"Model: {model}"],
+            metadata_lines=[f"Provider: {provider}", f"Model: {model}", f"Request Kind: {request_kind}"],
             sections=sections,
         )
 
@@ -605,6 +631,7 @@ class SessionLogger:
         model: str,
         stream: bool,
         metrics: Dict[str, Any],
+        request_kind: str,
     ) -> None:
         """Write an LLM response block."""
         self._ensure_initialized()
@@ -613,15 +640,57 @@ class SessionLogger:
         sections = self._append_json_block("RESPONSE JSON", response_payload)
         if metrics:
             sections.extend(self._append_json_block("METRICS", metrics))
-        self._write_timeline_block(
-            rule=SESSION_HEADER_RULE,
-            header=(
+        if request_kind == REQUEST_KIND_CONTEXT_COMPACTION:
+            header = (
+                f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | "
+                f"CONTEXT COMPACTION RESPONSE | STREAM={str(stream).lower()}"
+            )
+        else:
+            header = (
                 f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | "
                 f"LLM RESPONSE | STREAM={str(stream).lower()}"
-            ),
+            )
+        self._write_timeline_block(
+            rule=SESSION_HEADER_RULE,
+            header=header,
             timestamp=timestamp,
-            metadata_lines=[f"Provider: {provider}", f"Model: {model}"],
+            metadata_lines=[f"Provider: {provider}", f"Model: {model}", f"Request Kind: {request_kind}"],
             sections=sections,
+        )
+
+    def _record_context_compaction_event(
+        self,
+        turn_id: Optional[int],
+        stage: str,
+        details: Dict[str, Any],
+    ) -> None:
+        """Write a context compaction lifecycle block and structured event."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        event_kind = f"context_compaction_{stage}"
+        self._append_event(
+            event_kind,
+            timeline_seq,
+            turn_id=turn_id,
+            **details,
+        )
+
+        stage_label = {
+            "started": "CONTEXT COMPACTION START",
+            "completed": "CONTEXT COMPACTION END",
+            "failed": "CONTEXT COMPACTION FAILED",
+            "skipped": "CONTEXT COMPACTION SKIPPED",
+        }.get(stage, "CONTEXT COMPACTION")
+        if turn_id is None:
+            header = f"STEP {timeline_seq:04d} | {stage_label}"
+        else:
+            header = f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | {stage_label}"
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=header,
+            timestamp=timestamp,
+            sections=self._append_json_block("DETAILS", details),
         )
 
     def _record_skill_event(self, turn_id: int, event: str, details: Dict[str, Any]) -> None:

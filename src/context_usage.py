@@ -138,6 +138,7 @@ def build_context_usage_snapshot(agent, session_context, skill_manager=None) -> 
             )
 
     persisted_messages = session_context.get_messages()
+    compacted_summary_message = session_context.get_summary_message()
     message_rows = [
         MessageUsageRow(
             index=index,
@@ -167,6 +168,7 @@ def build_context_usage_snapshot(agent, session_context, skill_manager=None) -> 
         "Tool schemas": estimate_json_tokens(tool_schemas),
         "Skill catalog": estimate_text_tokens(skill_catalog),
         "Pinned skills": estimate_json_tokens(pinned_preload_messages),
+        "Compacted summary": estimate_json_tokens(compacted_summary_message),
         "Messages": estimate_json_tokens(persisted_messages),
     }
 
@@ -202,7 +204,15 @@ def build_context_usage_snapshot(agent, session_context, skill_manager=None) -> 
                 )
             )
 
+    current_config = Config.load()
     notes = ["Baseline excludes the next user message and any explicit $skill preloads."]
+    notes.append(
+        "Auto-compaction triggers at "
+        f"{current_config.context.auto_compact_threshold * 100:.0f}% and targets "
+        f"{current_config.context.target_usage_after_compaction * 100:.0f}% usage after compaction."
+    )
+    if compacted_summary_message is not None:
+        notes.append("Recent messages exclude any turns already compacted into the rolling summary.")
     if context_window is None:
         notes.append("Context window is not configured; percentages and free-space estimates are unavailable.")
     elif overflow_tokens:

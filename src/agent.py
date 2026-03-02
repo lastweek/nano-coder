@@ -3,10 +3,14 @@
 import json
 from time import perf_counter
 from typing import Callable, Optional, List, Dict, Tuple, Any
-from src.tools import ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL
+from src.tools import (
+    ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL,
+    REQUEST_KIND_AGENT_TURN, REQUEST_KIND_CONTEXT_COMPACTION
+)
 from src.logger import SessionLogger
 from src.metrics import LLMMetrics
-from src.config import config
+from src.config import Config, config
+from src.context_compaction import ContextCompactionManager, ContextCompactionPolicy
 from src.turn_activity import TurnActivityCallback, TurnActivityEvent
 
 
@@ -26,14 +30,15 @@ class Agent:
         self.tools = tools
         self.context = context
         self.skill_manager = skill_manager
-        self.max_iterations = config.agent.max_iterations
+        current_config = Config.load()
+        self.max_iterations = current_config.agent.max_iterations
         self.logger = SessionLogger(context.session_id)
         self.logger.start_session(
             cwd=self.context.cwd,
             provider=getattr(self.llm, "provider", "unknown"),
             model=getattr(self.llm, "model", "unknown"),
             base_url=getattr(self.llm, "base_url", None),
-            streaming_enabled=config.ui.enable_streaming,
+            streaming_enabled=current_config.ui.enable_streaming,
         )
 
         # Share logger with LLM client for request/response logging
@@ -42,6 +47,17 @@ class Agent:
 
         # Accumulate metrics across LLM requests
         self.request_metrics: List[LLMMetrics] = []
+        self.context_compaction = ContextCompactionManager(
+            self.llm,
+            self.context,
+            self.skill_manager,
+            ContextCompactionPolicy(
+                auto_compact=current_config.context.auto_compact,
+                auto_compact_threshold=current_config.context.auto_compact_threshold,
+                target_usage_after_compaction=current_config.context.target_usage_after_compaction,
+                min_recent_turns=current_config.context.min_recent_turns,
+            ),
+        )
 
         # Pre-build system message (hot-path optimization - avoids rebuilding on each request)
         tool_descriptions = "\n".join(
@@ -157,11 +173,25 @@ Be concise and helpful."""
             "cached_tokens": getattr(metrics, "cached_tokens", 0),
         }
 
+    def _record_prompt_metrics(self, metrics: Any) -> None:
+        """Persist the most recent prompt usage for compaction decisions."""
+        prompt_tokens = getattr(metrics, "prompt_tokens", None)
+        if isinstance(prompt_tokens, int) and prompt_tokens > 0:
+            self.context.last_prompt_tokens = prompt_tokens
+            cached_tokens = getattr(metrics, "cached_tokens", None)
+            self.context.last_prompt_cached_tokens = (
+                cached_tokens if isinstance(cached_tokens, int) else None
+            )
+        else:
+            self.context.last_prompt_tokens = None
+            self.context.last_prompt_cached_tokens = None
+        self.context.last_context_window = Config.load().llm.context_window
+
     def _initialize_turn(
         self,
         user_message: str,
         on_event: Optional[TurnActivityCallback] = None,
-    ) -> Tuple[int, List[str], List[str], str]:
+    ) -> Tuple[int, List[str], List[str], List[Dict[str, Any]], str]:
         """Initialize a new turn with message building and logging.
 
         Args:
@@ -171,7 +201,7 @@ Be concise and helpful."""
         Returns:
             Tuple of (turn_id, tools_used list, skills_used list, normalized_user_message)
         """
-        messages, normalized_user_message, pending_skill_events = self._build_messages(user_message)
+        normalized_user_message, preload_skill_names, pending_skill_events = self._prepare_turn_inputs(user_message)
         turn_id = self.logger.start_turn(
             raw_user_input=user_message,
             normalized_user_input=normalized_user_message,
@@ -184,16 +214,17 @@ Be concise and helpful."""
         if self._cached_tool_schemas is None:
             self._cached_tool_schemas = self.tools.get_tool_schemas()
 
+        self._maybe_auto_compact(turn_id, on_event)
+        messages = self._build_messages(normalized_user_message, preload_skill_names)
+
         return turn_id, tools_used, skills_used, messages, normalized_user_message
 
-    def _build_messages(self, user_message: str) -> Tuple[List[Dict], str, List[Tuple[str, Dict[str, Any]]]]:
-        """Build the message list and normalized user message for an LLM call."""
-        messages = [self._get_system_message()]
+    def _prepare_turn_inputs(
+        self,
+        user_message: str,
+    ) -> Tuple[str, List[str], List[Tuple[str, Dict[str, Any]]]]:
+        """Normalize the turn input and gather skill preloads without building messages."""
         pending_skill_events: List[Tuple[str, Dict[str, Any]]] = []
-
-        for msg in self.context.get_messages():
-            messages.append(msg)
-
         normalized_user_message = user_message
         preload_skill_names: List[str] = []
 
@@ -253,12 +284,92 @@ Be concise and helpful."""
                     },
                 ))
 
-            if preload_skill_names:
-                messages.extend(self.skill_manager.build_preload_messages(preload_skill_names))
+        return normalized_user_message, preload_skill_names, pending_skill_events
+
+    def _build_messages(self, normalized_user_message: str, preload_skill_names: List[str]) -> List[Dict]:
+        """Build the message list for the next LLM call."""
+        messages: List[Dict[str, Any]] = [self._get_system_message()]
+
+        summary_message = self.context.get_summary_message()
+        if summary_message is not None:
+            messages.append(summary_message)
+
+        messages.extend(self.context.get_messages())
+
+        if self.skill_manager and preload_skill_names:
+            messages.extend(self.skill_manager.build_preload_messages(preload_skill_names))
 
         messages.append({"role": ROLE_USER, "content": normalized_user_message})
+        return messages
 
-        return messages, normalized_user_message, pending_skill_events
+    def _maybe_auto_compact(
+        self,
+        turn_id: int,
+        on_event: Optional[TurnActivityCallback],
+    ) -> None:
+        """Compact older turns before the first model call when policy requires it."""
+        decision = self.context_compaction.build_decision(self)
+        if not decision.should_compact:
+            return
+
+        plan = self.context_compaction._build_plan(self, force=False)
+        if not plan.turns_to_compact:
+            return
+
+        self.logger.log_context_compaction_event(
+            turn_id=turn_id,
+            stage="started",
+            reason=decision.reason,
+            covered_turn_count=len(plan.turns_to_compact),
+            retained_turn_count=len(plan.retained_turns),
+        )
+        self._emit_turn_event(
+            on_event,
+            "context_compaction_started",
+            reason=decision.reason,
+            covered_turn_count=len(plan.turns_to_compact),
+            retained_turn_count=len(plan.retained_turns),
+        )
+
+        result = self.context_compaction.compact_now(
+            self,
+            decision.reason,
+            turn_id=turn_id,
+            force=False,
+        )
+        if result.error:
+            self.logger.log_context_compaction_event(
+                turn_id=turn_id,
+                stage="failed",
+                reason=decision.reason,
+                error=result.error,
+            )
+            self._emit_turn_event(
+                on_event,
+                "context_compaction_failed",
+                reason=decision.reason,
+                error=result.error,
+            )
+            return
+
+        self.logger.log_context_compaction_event(
+            turn_id=turn_id,
+            stage="completed",
+            reason=decision.reason,
+            covered_turn_count=result.covered_turn_count,
+            retained_turn_count=result.retained_turn_count,
+            before_tokens=result.before_tokens,
+            after_tokens=result.after_tokens,
+        )
+        self._emit_turn_event(
+            on_event,
+            "context_compaction_completed",
+            reason=decision.reason,
+            covered_turn_count=result.covered_turn_count,
+            retained_turn_count=result.retained_turn_count,
+            before_tokens=result.before_tokens,
+            after_tokens=result.after_tokens,
+        )
 
     def _assistant_message_from_response(self, response: Dict) -> Dict:
         """Convert an assistant response into a replayable conversation message."""
@@ -581,10 +692,16 @@ Be concise and helpful."""
                 response, metrics = self.llm.chat(
                     messages,
                     tools=self._cached_tool_schemas,
-                    log_context={"turn_id": turn_id, "iteration": iteration, "stream": False},
+                    log_context={
+                        "turn_id": turn_id,
+                        "iteration": iteration,
+                        "stream": False,
+                        "request_kind": REQUEST_KIND_AGENT_TURN,
+                    },
                 )
                 metrics.iteration = iteration
                 self.request_metrics.append(metrics)
+                self._record_prompt_metrics(metrics)
                 messages.append(self._assistant_message_from_response(response))
 
                 tool_calls = response.get("tool_calls", [])
@@ -681,7 +798,12 @@ Be concise and helpful."""
                 for chunk in self.llm.chat_stream(
                     messages,
                     tools=self._cached_tool_schemas,
-                    log_context={"turn_id": turn_id, "iteration": iteration, "stream": True},
+                    log_context={
+                        "turn_id": turn_id,
+                        "iteration": iteration,
+                        "stream": True,
+                        "request_kind": REQUEST_KIND_AGENT_TURN,
+                    },
                 ):
                     if "role" in chunk:
                         current_role = chunk["role"]
@@ -693,6 +815,7 @@ Be concise and helpful."""
                 if stream_metrics:
                     stream_metrics.iteration = iteration
                     self.request_metrics.append(stream_metrics)
+                    self._record_prompt_metrics(stream_metrics)
 
                 tool_calls = self.llm.get_stream_tool_calls()
                 metrics_for_event = stream_metrics or LLMMetrics()

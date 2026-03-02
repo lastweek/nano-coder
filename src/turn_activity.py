@@ -8,6 +8,9 @@ from typing import Any, Callable, Literal, Optional
 
 
 TurnActivityKind = Literal[
+    "context_compaction_started",
+    "context_compaction_completed",
+    "context_compaction_failed",
     "skill_preload",
     "skill_normalized",
     "skill_load_requested",
@@ -28,6 +31,11 @@ class TurnActivityEvent:
     """A user-safe activity event emitted during a turn.
 
     `details` keys by event kind:
+    - `context_compaction_started`: `reason`, `covered_turn_count`,
+      `retained_turn_count`
+    - `context_compaction_completed`: `reason`, `covered_turn_count`,
+      `retained_turn_count`, `before_tokens`, `after_tokens`
+    - `context_compaction_failed`: `reason`, `error`
     - `skill_preload`: `skill_name`, `reason`, `source`, `catalog_visible`
     - `skill_normalized`: `content`, `reason`
     - `skill_load_requested`: `skill_name`

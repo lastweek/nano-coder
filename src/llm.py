@@ -4,6 +4,7 @@ import os
 from typing import Optional, List, Dict, TYPE_CHECKING, Any
 from openai import OpenAI
 from src.config import config
+from src.tools import REQUEST_KIND_AGENT_TURN
 
 if TYPE_CHECKING:
     from src.logger import SessionLogger
@@ -362,6 +363,7 @@ class LLMClient:
                 provider=self.provider,
                 model=self.model,
                 stream=bool(log_context.get("stream", False)),
+                request_kind=log_context.get("request_kind", REQUEST_KIND_AGENT_TURN),
             )
 
         response = self.client.chat.completions.create(**kwargs)
@@ -404,6 +406,7 @@ class LLMClient:
                 model=self.model,
                 stream=bool(log_context.get("stream", False)),
                 metrics=self._metrics_to_dict(metrics),
+                request_kind=log_context.get("request_kind", REQUEST_KIND_AGENT_TURN),
             )
 
         return result, metrics
@@ -435,6 +438,7 @@ class LLMClient:
                 provider=self.provider,
                 model=self.model,
                 stream=bool(log_context.get("stream", True)),
+                request_kind=log_context.get("request_kind", REQUEST_KIND_AGENT_TURN),
             )
 
         # Create metrics tracker
@@ -539,6 +543,7 @@ class LLMClient:
                 model=self.model,
                 stream=bool(log_context.get("stream", True)),
                 metrics=self._metrics_to_dict(self._current_metrics),
+                request_kind=log_context.get("request_kind", REQUEST_KIND_AGENT_TURN),
             )
 
         # Store tool calls for retrieval by caller (eliminates need for duplicate API call)

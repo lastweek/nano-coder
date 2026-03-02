@@ -77,6 +77,39 @@ class UIConfig(BaseSettings):
     loading_indicator_interval: float = Field(default=0.8, gt=0)
 
 
+class ContextConfig(BaseSettings):
+    """Context compaction configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="CONTEXT_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"
+    )
+
+    auto_compact: bool = Field(default=True)
+    auto_compact_threshold: float = Field(default=0.85)
+    target_usage_after_compaction: float = Field(default=0.60)
+    min_recent_turns: int = Field(default=6, ge=1)
+
+    @field_validator("auto_compact_threshold")
+    @classmethod
+    def validate_auto_compact_threshold(cls, value: float) -> float:
+        """Ensure the auto-compaction threshold is a sensible ratio."""
+        if not 0 < value < 1:
+            raise ValueError("auto_compact_threshold must be between 0 and 1")
+        return value
+
+    @field_validator("target_usage_after_compaction")
+    @classmethod
+    def validate_target_usage_after_compaction(cls, value: float) -> float:
+        """Ensure the post-compaction target is a sensible ratio."""
+        if not 0 < value < 1:
+            raise ValueError("target_usage_after_compaction must be between 0 and 1")
+        return value
+
+
 class MCPServerConfig(BaseSettings):
     """Configuration for a single MCP server."""
 
@@ -134,7 +167,14 @@ class Config:
         self.logging = self._create_config(LoggingConfig, config_dict.get("logging", {}))
         self.agent = self._create_config(AgentConfig, config_dict.get("agent", {}))
         self.ui = self._create_config(UIConfig, config_dict.get("ui", {}))
+        self.context = self._create_config(ContextConfig, config_dict.get("context", {}))
         self.mcp = self._create_mcp_config(config_dict.get("mcp", {}))
+
+        if self.context.target_usage_after_compaction >= self.context.auto_compact_threshold:
+            raise ValueError(
+                "context.target_usage_after_compaction must be less than "
+                "context.auto_compact_threshold"
+            )
 
     @staticmethod
     def _create_config(config_class, yaml_values: dict):

@@ -10,7 +10,7 @@ from src.agent import Agent
 from src.commands import builtin
 from src.commands.registry import CommandRegistry
 from src.config import Config
-from src.context import Context
+from src.context import CompactedContextSummary, Context
 from src.skills import LoadSkillTool, SkillManager
 from src.tools import Tool, ToolRegistry, ToolResult
 
@@ -157,8 +157,10 @@ def test_context_command_prints_summary_and_category_table(temp_dir, monkeypatch
     assert "Tool schemas" in text
     assert "Skill catalog" in text
     assert "Pinned skills" in text
+    assert "Compacted summary" in text
     assert "Messages" in text
     assert "Free space" in text
+    assert "Auto-compaction triggers at 85% and targets 60% usage after compaction." in text
 
 
 def test_context_command_is_listed_in_help(temp_dir, monkeypatch):
@@ -212,6 +214,34 @@ def test_context_command_includes_pinned_skills_separately(temp_dir, monkeypatch
     assert "Skills" in text
     assert "catalog" in text
     assert "pinned" in text
+
+
+def test_context_command_counts_compacted_summary_separately(temp_dir, monkeypatch):
+    """Compacted summaries should be counted outside the raw Messages bucket."""
+    registry, agent, session_context, command_context = create_context_command_env(
+        temp_dir,
+        monkeypatch,
+        with_repo_skill=True,
+    )
+    session_context.add_message("user", "Older question")
+    session_context.add_message("assistant", "Older answer")
+    session_context.set_summary(
+        CompactedContextSummary(
+            updated_at="2026-03-02T00:00:00",
+            compaction_count=1,
+            covered_turn_count=1,
+            covered_message_count=2,
+            rendered_text="Conversation summary for earlier turns:\n- Keep going",
+        )
+    )
+    output = io.StringIO()
+    console = create_console(output)
+
+    registry.execute("/context", console, command_context)
+
+    text = output.getvalue()
+    assert "Compacted summary" in text
+    assert "Recent messages exclude any turns already compacted into the rolling summary." in text
 
 
 def test_context_command_includes_persisted_messages(temp_dir, monkeypatch):

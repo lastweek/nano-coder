@@ -6,6 +6,8 @@ from rich.panel import Panel
 from rich.text import Text
 from typing import Any, Optional
 
+from src.commands.help import render_command_help, render_unknown_subcommand
+from src.commands.registry import CommandHelpSpec, CommandSubcommandHelp
 from src.context_usage import build_context_usage_snapshot, format_token_count
 
 
@@ -62,14 +64,145 @@ def _format_percentage(value: Optional[float]) -> str:
     return f"{value:.1f}%"
 
 
+def _get_compaction_dependencies(console: Console, context: Any):
+    """Get context-compaction dependencies from command context."""
+    agent = context.get("agent")
+    session_context = context.get("session_context")
+    if agent is None or session_context is None:
+        console.print("[red]Agent and session context are required for /compact[/red]")
+        return None, None, None
+
+    compaction_manager = getattr(agent, "context_compaction", None)
+    if compaction_manager is None:
+        console.print("[red]Context compaction is not initialized[/red]")
+        return None, None, None
+
+    return agent, session_context, compaction_manager
+
+
 def register_all(registry):
     """Register all built-in commands."""
+
+    help_help_spec = CommandHelpSpec(
+        summary="List all available slash commands. Slash commands execute locally and do not go through the agent.",
+        usage=["/help"],
+        examples=["/help"],
+    )
+
+    tool_help_spec = CommandHelpSpec(
+        summary="List the tools available in the current session. An optional filter matches tool names and descriptions.",
+        usage=["/tool", "/tool <filter>"],
+        examples=["/tool", "/tool read", "/tool deepwiki"],
+    )
+
+    context_help_spec = CommandHelpSpec(
+        summary="Show an estimated next-call baseline for context usage in the current session.",
+        usage=["/context"],
+        examples=["/context"],
+        notes=[
+            "Baseline excludes the next user message.",
+            "Baseline excludes any explicit $skill preload for a future turn.",
+            "Token counts are rough estimates, not tokenizer-exact values.",
+        ],
+    )
+
+    compact_help_spec = CommandHelpSpec(
+        summary="Inspect or manage session-local context compaction for the current session.",
+        usage=[
+            "/compact",
+            "/compact show",
+            "/compact now",
+            "/compact auto on",
+            "/compact auto off",
+        ],
+        examples=["/compact", "/compact help now", "/compact auto off"],
+        notes=[
+            "Compaction is session-local.",
+            "There is no restore or reset command in v1.",
+            "/compact without arguments shows status.",
+        ],
+        subcommands=[
+            CommandSubcommandHelp(
+                name="show",
+                usage="/compact show",
+                description="Show the current rolling summary and its metadata.",
+                examples=["/compact show"],
+            ),
+            CommandSubcommandHelp(
+                name="now",
+                usage="/compact now",
+                description="Compact immediately using the current session state.",
+                examples=["/compact now"],
+            ),
+            CommandSubcommandHelp(
+                name="auto on",
+                usage="/compact auto on",
+                description="Enable auto-compaction for the current session.",
+                examples=["/compact auto on"],
+            ),
+            CommandSubcommandHelp(
+                name="auto off",
+                usage="/compact auto off",
+                description="Disable auto-compaction for the current session.",
+                examples=["/compact auto off"],
+            ),
+        ],
+    )
+
+    mcp_help_spec = CommandHelpSpec(
+        summary="List configured MCP servers and the tools they expose. Optionally filter to one server.",
+        usage=["/mcp", "/mcp <server_name>"],
+        examples=["/mcp", "/mcp deepwiki"],
+    )
+
+    skill_help_spec = CommandHelpSpec(
+        summary="List, inspect, pin, unpin, or reload skills for the current session.",
+        usage=[
+            "/skill",
+            "/skill use <name>",
+            "/skill clear <name|all>",
+            "/skill show <name>",
+            "/skill reload",
+        ],
+        examples=["/skill", "/skill help use", "/skill show pdf"],
+        notes=[
+            "/skill without arguments lists discovered skills.",
+            "Pinned skills stay active for future turns in the current session.",
+        ],
+        subcommands=[
+            CommandSubcommandHelp(
+                name="use",
+                usage="/skill use <name>",
+                description="Pin a skill for future turns in the current session.",
+                examples=["/skill use pdf"],
+            ),
+            CommandSubcommandHelp(
+                name="clear",
+                usage="/skill clear <name|all>",
+                description="Unpin one skill or clear all pinned skills.",
+                examples=["/skill clear pdf", "/skill clear all"],
+            ),
+            CommandSubcommandHelp(
+                name="show",
+                usage="/skill show <name>",
+                description="Show metadata, source path, and resource inventory for a skill.",
+                examples=["/skill show pdf"],
+            ),
+            CommandSubcommandHelp(
+                name="reload",
+                usage="/skill reload",
+                description="Rescan skill directories and refresh the discovered skill list.",
+                examples=["/skill reload"],
+            ),
+        ],
+    )
 
     @registry.register(
         "help",
         "Show available commands",
         args_description="",
-        short_desc="Show all commands"
+        short_desc="Show all commands",
+        help_spec=help_help_spec,
     )
     def cmd_help(console: Console, args: str, context: Any):
         """Show help for available commands."""
@@ -92,7 +225,8 @@ def register_all(registry):
         "tool",
         "List all available tools",
         args_description="[filter]",
-        short_desc="List available tools"
+        short_desc="List available tools",
+        help_spec=tool_help_spec,
     )
     def cmd_tool(console: Console, args: str, context: Any):
         """List available tools in the current context."""
@@ -144,7 +278,8 @@ def register_all(registry):
         "context",
         "Show estimated context usage for the next LLM call",
         args_description="",
-        short_desc="Show context usage"
+        short_desc="Show context usage",
+        help_spec=context_help_spec,
     )
     def cmd_context(console: Console, args: str, context: Any):
         """Show a repo-native next-call context usage estimate."""
@@ -215,10 +350,220 @@ def register_all(registry):
             console.print(f"[dim]{note}[/dim]")
 
     @registry.register(
+        "compact",
+        "Inspect or manage session-local context compaction",
+        args_description="[show|now|auto on|auto off]",
+        short_desc="Manage context compaction",
+        help_spec=compact_help_spec,
+    )
+    def cmd_compact(console: Console, args: str, context: Any):
+        """Inspect or manage rolling context compaction."""
+        agent, session_context, compaction_manager = _get_compaction_dependencies(console, context)
+        if agent is None or session_context is None or compaction_manager is None:
+            return
+
+        raw_args = args.strip()
+        parts = raw_args.split()
+
+        def render_status() -> None:
+            snapshot = compaction_manager.render_status_snapshot(agent)
+            context_window = snapshot["context_window"]
+            total_text = format_token_count(context_window)
+            used_text = format_token_count(snapshot["current_used_tokens"])
+            percentage_text = _format_percentage(snapshot["current_used_percentage"])
+            body = "\n".join([
+                f"[bold]Auto-compaction:[/bold] {'on' if snapshot['auto_compaction_enabled'] else 'off'}",
+                f"[bold]Configured by config:[/bold] {'on' if snapshot['configured_auto_compact'] else 'off'}",
+                f"[bold]Threshold:[/bold] {snapshot['auto_compact_threshold'] * 100:.0f}%",
+                f"[bold]Target after compaction:[/bold] {snapshot['target_usage_after_compaction'] * 100:.0f}%",
+                f"[bold]Configured recent turns retained:[/bold] {snapshot['min_recent_turns']}",
+                f"[bold]Effective recent turns retained:[/bold] {snapshot['effective_retained_turns']}",
+                f"[bold]Current baseline:[/bold] {used_text} / {total_text} ({percentage_text})",
+                (
+                    f"[bold]Auto decision:[/bold] "
+                    f"{'compact now' if snapshot['decision_should_compact'] else 'skip'} "
+                    f"({snapshot['decision_reason']})"
+                ),
+                f"[bold]Decision detail:[/bold] {snapshot['decision_reason_text']}",
+                f"[bold]Summary present:[/bold] {'yes' if snapshot['summary_present'] else 'no'}",
+                f"[bold]Summary-covered turns:[/bold] {snapshot['summary_covered_turn_count']}",
+                f"[bold]Raw retained turns:[/bold] {snapshot['raw_retained_turn_count']}",
+            ])
+            console.print(Panel(body, title="Context Compaction", border_style="cyan"))
+
+        def render_manual_steps(plan, details: dict[str, Any], result) -> None:
+            complete_turns = details.get("complete_turn_count", 0)
+            evictable_turns = details.get("evictable_turn_count", 0)
+            configured_retained = details.get(
+                "configured_min_recent_turns",
+                compaction_manager.policy.min_recent_turns,
+            )
+            effective_retained = details.get("effective_retained_turns", len(plan.retained_turns))
+            baseline_tokens = format_token_count(details.get("current_used_tokens"))
+
+            lines = [
+                "[bold]Manual compaction steps[/bold]",
+                (
+                    "1. Inspect current context: "
+                    f"{complete_turns} complete turn(s), baseline {baseline_tokens}."
+                ),
+                (
+                    "2. Apply adaptive retention: "
+                    f"keep {effective_retained} raw turn(s) "
+                    f"(configured cap {configured_retained}), "
+                    f"leaving {evictable_turns} evictable older turn(s)."
+                ),
+            ]
+
+            if result.status == "skipped":
+                lines.append(
+                    "3. Stop: "
+                    f"{compaction_manager.describe_reason(result.reason, result.details)}"
+                )
+            else:
+                lines.append(
+                    "3. Select turns to summarize: "
+                    f"force mode compacts all {len(plan.turns_to_compact)} evictable older turn(s)."
+                )
+                if result.error:
+                    lines.append(
+                        "4. Summary generation failed, so Nano-Coder used the deterministic fallback summary."
+                    )
+                else:
+                    lines.append(
+                        "4. Generate or update the rolling summary with the configured model."
+                    )
+                lines.append(
+                    "5. Replace older raw history with the retained recent turns and store the new summary."
+                )
+                lines.append(
+                    "6. Recalculate baseline usage: "
+                    f"{format_token_count(result.before_tokens)} -> {format_token_count(result.after_tokens)}."
+                )
+
+            console.print(Panel("\n".join(lines), title="Manual Compaction", border_style="cyan"))
+
+        if not parts:
+            render_status()
+            return
+
+        if parts[0] == "show":
+            summary = session_context.get_summary()
+            if summary is None:
+                console.print("[yellow]No compacted summary is available for this session[/yellow]")
+                return
+
+            metadata = "\n".join([
+                f"[bold]Updated:[/bold] {summary.updated_at}",
+                f"[bold]Compactions:[/bold] {summary.compaction_count}",
+                f"[bold]Covered turns:[/bold] {summary.covered_turn_count}",
+                f"[bold]Covered messages:[/bold] {summary.covered_message_count}",
+            ])
+            console.print(Panel(metadata, title="Compacted Summary", border_style="cyan"))
+            console.print(summary.rendered_text)
+            return
+
+        if parts[0] == "now":
+            logger = getattr(agent, "logger", None)
+            plan_preview = compaction_manager._build_plan(agent, force=True)
+            preview_details = compaction_manager._build_debug_details(
+                plan_preview,
+                current_used_tokens=plan_preview.before_tokens,
+                threshold_tokens=(
+                    int(plan_preview.context_window * compaction_manager.policy.auto_compact_threshold)
+                    if plan_preview.context_window is not None
+                    else None
+                ),
+                force=True,
+            )
+            if logger is not None:
+                logger.log_context_compaction_event(
+                    turn_id=None,
+                    stage="started",
+                    reason="manual_command",
+                    covered_turn_count=len(plan_preview.turns_to_compact),
+                    retained_turn_count=len(plan_preview.retained_turns),
+                    **preview_details,
+                )
+
+            result = compaction_manager.compact_now(agent, "manual_command", force=True)
+            if result.status == "skipped":
+                if logger is not None:
+                    logger.log_context_compaction_event(
+                        turn_id=None,
+                        stage="skipped",
+                        reason=result.reason,
+                        reason_text=compaction_manager.describe_reason(result.reason, result.details),
+                        **result.details,
+                    )
+                console.print(
+                    "[yellow]Context compaction skipped:[/yellow] "
+                    f"{compaction_manager.describe_reason(result.reason, result.details)}"
+                )
+                render_manual_steps(plan_preview, result.details, result)
+                for line in compaction_manager.render_debug_lines(result.details):
+                    console.print(f"[dim]{line}[/dim]")
+                return
+
+            if result.error:
+                if logger is not None:
+                    logger.log_context_compaction_event(
+                        turn_id=None,
+                        stage="failed",
+                        reason=result.reason,
+                        error=result.error,
+                        **result.details,
+                    )
+                console.print(f"[yellow]Compaction used fallback summary:[/yellow] {result.error}")
+            elif logger is not None:
+                logger.log_context_compaction_event(
+                    turn_id=None,
+                    stage="completed",
+                    reason=result.reason,
+                    covered_turn_count=result.covered_turn_count,
+                    retained_turn_count=result.retained_turn_count,
+                    before_tokens=result.before_tokens,
+                    after_tokens=result.after_tokens,
+                    **result.details,
+                )
+
+            render_manual_steps(plan_preview, result.details, result)
+            console.print(
+                "[green]Context compacted:[/green] "
+                f"{result.covered_turn_count} turns summarized, "
+                f"{result.retained_turn_count} recent turns kept, "
+                f"{format_token_count(result.before_tokens)} -> {format_token_count(result.after_tokens)}"
+            )
+            return
+
+        if parts[0] == "auto" and len(parts) == 2:
+            if parts[1] == "on":
+                session_context.set_auto_compaction(True)
+                console.print("[green]Auto-compaction enabled for this session[/green]")
+                return
+            if parts[1] == "off":
+                session_context.set_auto_compaction(False)
+                console.print("[green]Auto-compaction disabled for this session[/green]")
+                return
+
+        command = registry.get_command("compact")
+        if parts[0] == "auto" and command is not None:
+            console.print("[yellow]Missing /compact auto action: expected on or off[/yellow]")
+            render_command_help(console, command, "auto")
+            return
+
+        if command is not None:
+            render_unknown_subcommand(console, command, parts[0])
+            return
+
+        console.print(f"[red]Unknown /compact subcommand: {parts[0]}[/red]")
+
+    @registry.register(
         "mcp",
         "List MCP servers and their tools",
         args_description="[server_name]",
-        short_desc="List MCP servers"
+        short_desc="List MCP servers",
+        help_spec=mcp_help_spec,
     )
     def cmd_mcp(console: Console, args: str, context: Any):
         """List MCP servers and their tools."""
@@ -282,7 +627,8 @@ def register_all(registry):
         "skill",
         "List, inspect, pin, or reload skills",
         args_description="[use|clear|show|reload] [name]",
-        short_desc="Manage skills"
+        short_desc="Manage skills",
+        help_spec=skill_help_spec,
     )
     def cmd_skill(console: Console, args: str, context: Any):
         """Manage discovered skills."""
@@ -301,7 +647,10 @@ def register_all(registry):
 
         if subcommand == "use":
             if not remainder:
-                console.print("[yellow]Usage: /skill use <name>[/yellow]")
+                console.print("[yellow]Missing skill name for /skill use[/yellow]")
+                command = registry.get_command("skill")
+                if command is not None:
+                    render_command_help(console, command, "use")
                 return
 
             skill = skill_manager.get_skill(remainder)
@@ -315,7 +664,10 @@ def register_all(registry):
 
         if subcommand == "clear":
             if not remainder:
-                console.print("[yellow]Usage: /skill clear <name|all>[/yellow]")
+                console.print("[yellow]Missing target for /skill clear[/yellow]")
+                command = registry.get_command("skill")
+                if command is not None:
+                    render_command_help(console, command, "clear")
                 return
 
             if remainder.lower() == "all":
@@ -334,7 +686,10 @@ def register_all(registry):
 
         if subcommand == "show":
             if not remainder:
-                console.print("[yellow]Usage: /skill show <name>[/yellow]")
+                console.print("[yellow]Missing skill name for /skill show[/yellow]")
+                command = registry.get_command("skill")
+                if command is not None:
+                    render_command_help(console, command, "show")
                 return
 
             skill = skill_manager.get_skill(remainder)
@@ -387,5 +742,9 @@ def register_all(registry):
             console.print(f"[green]Reloaded {len(skill_manager.list_skills())} skill(s)[/green]")
             return
 
+        command = registry.get_command("skill")
+        if command is not None:
+            render_unknown_subcommand(console, command, subcommand)
+            return
+
         console.print(f"[red]Unknown /skill subcommand: {subcommand}[/red]")
-        console.print("[dim]Usage: /skill [use|clear|show|reload] [name][/dim]")

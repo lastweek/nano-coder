@@ -181,6 +181,103 @@ class TestSessionLogger:
         assert "\"file_path\": \"README.md\"" in llm_log
         assert "\"reason\": \"explicit\"" in llm_log
 
+    def test_logs_context_compaction_lifecycle_and_request_kind(self, temp_dir):
+        """Compaction lifecycle and request-kind labeling should be explicit in the logs."""
+        logger = self._build_logger(temp_dir)
+        turn_id = logger.start_turn(raw_user_input="hello", normalized_user_input="hello")
+
+        logger.log_context_compaction_event(
+            turn_id=turn_id,
+            stage="started",
+            reason="threshold_reached",
+            covered_turn_count=4,
+            retained_turn_count=2,
+        )
+        logger.log_llm_request(
+            turn_id=turn_id,
+            iteration=0,
+            provider="openai",
+            model="gpt-4.1",
+            stream=False,
+            request_kind="context_compaction",
+            request_payload={
+                "model": "gpt-4.1",
+                "messages": [{"role": "system", "content": "Summarize"}],
+                "stream": False,
+            },
+        )
+        logger.log_llm_response(
+            turn_id=turn_id,
+            iteration=0,
+            provider="openai",
+            model="gpt-4.1",
+            stream=False,
+            request_kind="context_compaction",
+            response_payload={
+                "object": "chat.completion",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "{}"}}],
+            },
+            metrics={"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13, "cached_tokens": 0},
+        )
+        logger.log_context_compaction_event(
+            turn_id=turn_id,
+            stage="completed",
+            reason="threshold_reached",
+            covered_turn_count=4,
+            retained_turn_count=2,
+            before_tokens=180000,
+            after_tokens=110000,
+        )
+        logger.finish_turn(turn_id, "done", [], status="completed")
+        logger.close()
+
+        session_dir = next(Path(temp_dir).glob("session-*"))
+        llm_log = (session_dir / "llm.log").read_text()
+        assert "CONTEXT COMPACTION START" in llm_log
+        assert "CONTEXT COMPACTION REQUEST" in llm_log
+        assert "Request Kind: context_compaction" in llm_log
+        assert "CONTEXT COMPACTION RESPONSE" in llm_log
+        assert "CONTEXT COMPACTION END" in llm_log
+
+        events = [
+            json.loads(line)
+            for line in (session_dir / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        kinds = [event["kind"] for event in events]
+        assert "context_compaction_started" in kinds
+        assert "context_compaction_completed" in kinds
+
+    def test_logs_context_compaction_skipped_block(self, temp_dir):
+        """Skipped compaction attempts should be explicit in llm.log and events."""
+        logger = self._build_logger(temp_dir)
+
+        logger.log_context_compaction_event(
+            turn_id=None,
+            stage="skipped",
+            reason="not_enough_complete_turns",
+            reason_text="Not enough complete turns are available to compact while retaining 2 recent turn(s).",
+            complete_turn_count=0,
+            evictable_turn_count=0,
+            min_recent_turns=2,
+            force=True,
+        )
+        logger.close()
+
+        session_dir = next(Path(temp_dir).glob("session-*"))
+        llm_log = (session_dir / "llm.log").read_text()
+        assert "CONTEXT COMPACTION SKIPPED" in llm_log
+        assert "\"reason\": \"not_enough_complete_turns\"" in llm_log
+        assert "\"complete_turn_count\": 0" in llm_log
+
+        events = [
+            json.loads(line)
+            for line in (session_dir / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        kinds = [event["kind"] for event in events]
+        assert "context_compaction_skipped" in kinds
+
     def test_async_mode_preserves_valid_output(self, temp_dir):
         """Async logging should still produce readable files."""
         logger = self._build_logger(temp_dir, async_mode=True)

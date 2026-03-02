@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from src.agent import Agent
 from src.config import config
-from src.context import Context
+from src.context import CompactedContextSummary, Context
 from src.skills import LoadSkillTool, SkillManager
 from src.tools import ToolRegistry
 
@@ -121,6 +121,45 @@ def test_pinned_skills_are_preloaded_outside_system_prompt(temp_dir):
         {"role": "user", "content": "help"},
         {"role": "assistant", "content": "Done"},
     ]
+
+
+def test_summary_message_is_injected_before_pinned_skill_preloads(temp_dir):
+    """Rolling summaries should be injected before raw history and pinned skill preloads."""
+    repo_root = temp_dir / "repo"
+    write_skill(
+        repo_root / ".nano-coder" / "skills" / "pdf",
+        body="Always inspect layout before edits.",
+    )
+    manager = SkillManager(repo_root=repo_root, user_root=temp_dir / "user-skills")
+    manager.discover()
+
+    tools = ToolRegistry()
+    tools.register(LoadSkillTool(manager))
+    llm = StubLLM([{"role": "assistant", "content": "Done"}])
+    context = Context.create(cwd=str(repo_root))
+    context.set_summary(
+        CompactedContextSummary(
+            updated_at="2026-03-02T00:00:00",
+            compaction_count=1,
+            covered_turn_count=3,
+            covered_message_count=6,
+            rendered_text="Conversation summary for earlier turns:\n- Ship compaction",
+        )
+    )
+    context.activate_skill("pdf")
+    agent = Agent(llm, tools, context, skill_manager=manager)
+
+    agent.run("help")
+
+    messages = llm.calls[0]["messages"]
+    assert messages[1]["role"] == "assistant"
+    assert "Conversation summary for earlier turns:" in messages[1]["content"]
+    preload_assistant = next(
+        message
+        for message in messages
+        if message["role"] == "assistant" and message.get("tool_calls")
+    )
+    assert messages.index(preload_assistant) > 1
 
 
 def test_explicit_skill_mention_preloads_and_cleans_user_message(temp_dir):

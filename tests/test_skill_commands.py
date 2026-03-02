@@ -167,3 +167,58 @@ def test_skill_command_reports_unknown_skill(temp_dir):
     registry.execute("/skill show missing", console, command_context)
 
     assert "Unknown skill: missing" in output.getvalue()
+
+
+def test_skill_help_renders_full_manual(temp_dir):
+    """`/skill help` should render the command manual."""
+    registry, _, _, command_context = create_skill_context(temp_dir)
+    output = io.StringIO()
+    console = create_console(output)
+
+    registry.execute("/skill help", console, command_context)
+
+    text = output.getvalue()
+    assert "Command: /skill" in text
+    assert "/skill use <name>" in text
+    assert "/skill reload" in text
+
+
+def test_skill_targeted_help_renders_selected_subcommand(temp_dir):
+    """`/skill help clear` should render targeted subcommand help."""
+    registry, _, _, command_context = create_skill_context(temp_dir)
+    output = io.StringIO()
+    console = create_console(output)
+
+    registry.execute("/skill help clear", console, command_context)
+
+    text = output.getvalue()
+    assert "Command: /skill (clear)" in text
+    assert "/skill clear <name|all>" in text
+    assert "Unpin one skill or clear all pinned skills." in text
+
+
+def test_skill_unknown_subcommand_prints_manual(temp_dir):
+    """Unknown `/skill` subcommands should print the full manual after the error."""
+    registry, _, _, command_context = create_skill_context(temp_dir)
+    output = io.StringIO()
+    console = create_console(output)
+
+    registry.execute("/skill helo", console, command_context)
+
+    text = output.getvalue()
+    assert "Unknown /skill subcommand: helo" in text
+    assert "Command: /skill" in text
+
+
+def test_skill_use_missing_argument_shows_targeted_help(temp_dir):
+    """`/skill use` should explain the missing name and show `use` help."""
+    registry, _, _, command_context = create_skill_context(temp_dir)
+    output = io.StringIO()
+    console = create_console(output)
+
+    registry.execute("/skill use", console, command_context)
+
+    text = output.getvalue()
+    assert "Missing skill name for /skill use" in text
+    assert "Command: /skill (use)" in text
+    assert "/skill use <name>" in text

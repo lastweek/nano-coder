@@ -278,6 +278,59 @@ def test_run_agent_turn_includes_skill_preload_summary():
     assert normalized.count("Skill preloaded: pdf (explicit)") == 1
 
 
+def test_run_agent_turn_includes_compaction_summary():
+    """Context compaction should appear in the persisted CLI summary."""
+    from src.main import run_agent_turn
+
+    class StubAgent:
+        context = StubContext()
+
+        def run(self, user_input, on_tool_call=None, on_event=None):
+            on_event(TurnActivityEvent("context_compaction_started", details={
+                "reason": "threshold_reached",
+                "covered_turn_count": 4,
+                "retained_turn_count": 2,
+            }))
+            on_event(TurnActivityEvent("context_compaction_completed", details={
+                "reason": "threshold_reached",
+                "covered_turn_count": 4,
+                "retained_turn_count": 2,
+                "before_tokens": 180000,
+                "after_tokens": 110000,
+            }))
+            on_event(TurnActivityEvent("llm_call_finished", iteration=0, details={
+                "stream": False,
+                "duration_s": 0.1,
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "cached_tokens": 4,
+                "has_tool_calls": False,
+                "tool_call_count": 0,
+                "result_kind": "final_answer",
+            }))
+            on_event(TurnActivityEvent("turn_completed", details={
+                "status": "completed",
+                "llm_call_count": 1,
+                "tool_call_count": 0,
+                "tools_used": [],
+                "skills_used": [],
+            }))
+            return "Done"
+
+    console = make_recording_console()
+    run_agent_turn(
+        console,
+        StubAgent(),
+        "hello",
+        enable_streaming=False,
+        skill_debug=False,
+    )
+    normalized = normalize_output(console.export_text())
+    assert "Context compacted: 4 older turns summarized" in normalized
+    assert normalized.count("Context compacted: 4 older turns summarized") == 1
+
+
 def test_run_agent_turn_shows_tool_failure_clearly():
     """Failed tools should remain visible in the persisted summary."""
     from src.main import run_agent_turn

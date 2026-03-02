@@ -90,6 +90,12 @@ class TurnProgressDisplay:
 
         if event.kind == "skill_preload":
             return f"Preparing skill context: {details.get('skill_name')}"
+        if event.kind == "context_compaction_started":
+            return "Compacting context"
+        if event.kind == "context_compaction_completed":
+            return "Context compacted"
+        if event.kind == "context_compaction_failed":
+            return "Context compaction failed"
         if event.kind == "skill_normalized":
             return "Preparing skill context"
         if event.kind == "skill_load_requested":
@@ -131,6 +137,23 @@ class TurnProgressDisplay:
                     f"catalog={'yes' if details.get('catalog_visible') else 'no'}]"
                 )
             return line
+
+        if event.kind == "context_compaction_started":
+            return None if summary else (
+                f"Compacting context: {details.get('covered_turn_count', 0)} older turns"
+            )
+
+        if event.kind == "context_compaction_completed":
+            line = (
+                f"Context compacted: {details.get('covered_turn_count', 0)} turns summarized, "
+                f"{details.get('retained_turn_count', 0)} recent turns kept"
+            )
+            if summary:
+                return f"Context compacted: {details.get('covered_turn_count', 0)} older turns summarized"
+            return line
+
+        if event.kind == "context_compaction_failed":
+            return f"Context compaction failed: {details.get('error')}"
 
         if event.kind == "skill_normalized":
             return None if summary else "Using preloaded skill context for this request"

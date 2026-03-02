@@ -201,16 +201,38 @@ Nano-Coder supports built-in slash commands that bypass the agent:
 - `/skill` - list, pin, unpin, inspect, and reload skills
 - `/context` - estimate next-call baseline context usage
 
+Each slash command also supports built-in manual help:
+
+- `/command help`
+- `/command --help`
+- `/command -h`
+
 ### `/skill`
 
 Supported forms:
 
 - `/skill`
+- `/skill help`
+- `/skill help <subcommand>`
 - `/skill use <name>`
 - `/skill clear <name>`
 - `/skill clear all`
 - `/skill show <name>`
 - `/skill reload`
+
+### `/compact`
+
+Supported forms:
+
+- `/compact`
+- `/compact help`
+- `/compact help <subcommand>`
+- `/compact show`
+- `/compact now`
+- `/compact auto on`
+- `/compact auto off`
+
+For the full execution model, summary lifecycle, and logging flow, see [doc/context-compaction.md](doc/context-compaction.md).
 
 ### `/context`
 

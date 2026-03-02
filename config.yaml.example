@@ -21,6 +21,12 @@ ui:
   enable_streaming: true
   loading_indicator_interval: 0.8
 
+context:
+  auto_compact: true
+  auto_compact_threshold: 0.85
+  target_usage_after_compaction: 0.60
+  min_recent_turns: 6
+
 # MCP (Model Context Protocol) Servers
 # External tool servers that nano-coder can connect to
 mcp:

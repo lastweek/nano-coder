@@ -1,8 +1,34 @@
 """Slash command system for nano-coder meta-commands."""
 
+from __future__ import annotations
+
 from typing import Callable, Dict, List, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from rich.console import Console
+
+from src.commands.help import render_command_help, render_unknown_subcommand
+
+
+@dataclass(frozen=True)
+class CommandSubcommandHelp:
+    """Help metadata for a single slash-command subcommand."""
+
+    name: str
+    usage: str
+    description: str
+    examples: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CommandHelpSpec:
+    """Help metadata for a slash command."""
+
+    summary: str
+    usage: List[str]
+    examples: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    subcommands: List[CommandSubcommandHelp] = field(default_factory=list)
 
 
 @dataclass
@@ -14,6 +40,7 @@ class Command:
     handler: Callable[..., None]
     args_description: Optional[str] = None
     short_desc: str = ""  # Short description for menu (50 chars max)
+    help_spec: Optional[CommandHelpSpec] = None
 
 
 class CommandRegistry:
@@ -27,7 +54,8 @@ class CommandRegistry:
         name: str,
         description: str,
         args_description: str = None,
-        short_desc: str = ""
+        short_desc: str = "",
+        help_spec: Optional[CommandHelpSpec] = None,
     ):
         """Decorator to register a command.
 
@@ -36,6 +64,7 @@ class CommandRegistry:
             description: What the command does
             args_description: Optional description of arguments
             short_desc: Short description for menu (50 chars max)
+            help_spec: Optional help/manual metadata for the command
 
         Example:
             @registry.register("echo", "Print a message", short_desc="Echo text")
@@ -48,7 +77,8 @@ class CommandRegistry:
                 description=description,
                 handler=func,
                 args_description=args_description,
-                short_desc=short_desc
+                short_desc=short_desc,
+                help_spec=help_spec,
             )
             return func
         return decorator
@@ -78,6 +108,20 @@ class CommandRegistry:
             console.print(f"[dim]Type /help for available commands[/dim]")
             return True  # It was a command, just unknown
 
+        help_target = self._parse_help_target(args)
+        if help_target is not False:
+            if help_target is None:
+                render_command_help(console, command)
+            elif command.help_spec and command.help_spec.subcommands:
+                matches = self._find_subcommand_help(command, help_target)
+                if matches:
+                    render_command_help(console, command, help_target)
+                else:
+                    render_unknown_subcommand(console, command, help_target)
+            else:
+                render_unknown_subcommand(console, command, help_target)
+            return True
+
         try:
             command.handler(console, args, context)
         except Exception as e:
@@ -92,3 +136,46 @@ class CommandRegistry:
     def get_command_names(self) -> List[str]:
         """Get all command names."""
         return list(self._commands.keys())
+
+    def get_command(self, name: str) -> Optional[Command]:
+        """Get a registered command by name."""
+        return self._commands.get(name)
+
+    @staticmethod
+    def _parse_help_target(args: str) -> str | None | bool:
+        """Parse slash-command help triggers from the raw argument string.
+
+        Returns:
+            None for command-level help,
+            a string for targeted subcommand help,
+            False when no help trigger is present.
+        """
+        stripped = args.strip()
+        if stripped in {"help", "--help", "-h"}:
+            return None
+        if stripped.startswith("help "):
+            target = stripped[5:].strip()
+            return target or None
+        return False
+
+    @staticmethod
+    def _find_subcommand_help(command: Command, subcommand: str) -> List[CommandSubcommandHelp]:
+        """Find help entries matching a targeted subcommand request."""
+        if not command.help_spec:
+            return []
+
+        target = subcommand.strip().lower()
+        if not target:
+            return []
+
+        exact_matches = [
+            entry for entry in command.help_spec.subcommands
+            if entry.name.lower() == target
+        ]
+        if exact_matches:
+            return exact_matches
+
+        return [
+            entry for entry in command.help_spec.subcommands
+            if entry.name.lower().startswith(f"{target} ")
+        ]

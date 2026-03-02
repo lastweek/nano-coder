@@ -5,14 +5,14 @@ import sys
 import threading
 import random
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 # Add parent directory to path to allow imports when running directly
 if __name__ == "__main__" and __file__:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
-from rich.console import Console
+from rich.console import Console, Group
 from src.input_helper import InputHelper
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -28,6 +28,10 @@ from tools.bash import BashTool
 from src.agent import Agent
 from src.metrics_display import display_metrics
 from src.config import config
+from src.mcp import MCPManager
+from src.skills import LoadSkillTool, SkillManager
+from src.commands import CommandRegistry
+from src.commands import builtin
 
 # Constants for loading indicator
 LOADING_INDICATOR_ROTATION_INTERVAL = 0.8  # seconds between status word changes
@@ -78,9 +82,44 @@ def print_banner(console: Console) -> None:
 
 def on_tool_call(console: Console, tool_name: str, args: dict) -> None:
     """Callback when a tool is called."""
-    # Format args for display
+    console.print(f"[dim]{_format_tool_call_line(tool_name, args)}[/dim]")
+
+
+def _format_tool_call_line(tool_name: str, args: dict) -> str:
+    """Format a tool call for display."""
     args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
-    console.print(f"[dim]  → {tool_name}({args_str})[/dim]")
+    return f"  → {tool_name}({args_str})"
+
+
+def _append_assistant_chunk(events: List[Tuple[str, str]], chunk: str) -> None:
+    """Append streamed assistant text while preserving chronology."""
+    if not chunk:
+        return
+
+    if events and events[-1][0] == "assistant":
+        event_type, content = events[-1]
+        events[-1] = (event_type, content + chunk)
+        return
+
+    events.append(("assistant", chunk))
+
+
+def _build_stream_renderable(
+    events: List[Tuple[str, str]],
+    loading_text: Optional[Text] = None,
+):
+    """Build the current streaming preview renderable."""
+    if not events:
+        return loading_text if loading_text is not None else Text("")
+
+    renderables = []
+    for event_type, content in events:
+        if event_type == "assistant":
+            renderables.append(Markdown(content))
+        elif event_type == "tool":
+            renderables.append(Text(content, style="dim"))
+
+    return Group(*renderables)
 
 
 def create_loading_indicator() -> tuple:
@@ -96,7 +135,7 @@ def rotate_loading_indicator(
     live: Live,
     text_obj: Text,
     status_words: List[str],
-    first_token_arrived: List[bool]
+    first_activity: List[bool]
 ) -> None:
     """Rotate loading indicator status words via background timer.
 
@@ -104,10 +143,10 @@ def rotate_loading_indicator(
         live: Rich Live display instance
         text_obj: Current Text object being displayed
         status_words: List of status word strings
-        first_token_arrived: Mutable list [bool] to track token arrival
+        first_activity: Mutable list [bool] to track first output activity
     """
-    # Stop if first token arrived
-    if first_token_arrived[0]:
+    # Stop once the stream has produced visible activity.
+    if first_activity[0]:
         return
 
     # Pick random status word (different from current)
@@ -117,13 +156,13 @@ def rotate_loading_indicator(
 
     # Update display
     text_obj.plain = new_word
-    live.update(text_obj)
+    live.update(text_obj, refresh=True)
 
     # Schedule next rotation
     timer = threading.Timer(
         LOADING_INDICATOR_ROTATION_INTERVAL,
         rotate_loading_indicator,
-        args=(live, text_obj, status_words, first_token_arrived)
+        args=(live, text_obj, status_words, first_activity)
     )
     timer.daemon = True
     timer.start()
@@ -140,47 +179,62 @@ def display_streaming_response(console: Console, agent, user_input: str) -> str:
     Returns:
         The complete response text
     """
-    # Create loading indicator
     loading_text, status_words = create_loading_indicator()
-    first_token_arrived = [False]  # Mutable list for closure access
+    first_activity = [False]
     rotation_timer = None
+    events: List[Tuple[str, str]] = []
+    response_chunks: List[str] = []
+    live_ref: List[Optional[Live]] = [None]
 
-    with Live(loading_text, console=console, refresh_per_second=10) as live:
-        # Start rotation timer for loading indicator
-        rotation_timer = threading.Timer(
-            LOADING_INDICATOR_ROTATION_INTERVAL,
-            rotate_loading_indicator,
-            args=(live, loading_text, status_words, first_token_arrived)
-        )
-        rotation_timer.daemon = True
-        rotation_timer.start()
+    def handle_tool_call(tool_name: str, args: dict) -> None:
+        """Record tool calls in the live markdown preview."""
+        first_activity[0] = True
+        events.append(("tool", _format_tool_call_line(tool_name, args)))
+        if live_ref[0] is not None:
+            live_ref[0].update(
+                _build_stream_renderable(events, loading_text),
+                refresh=True,
+            )
 
-        # Accumulate tokens when they arrive
-        accumulated = Text()
+    stream = agent.run_stream(
+        user_input,
+        on_tool_call=handle_tool_call
+    )
 
-        for token in agent.run_stream(
-            user_input,
-            on_tool_call=lambda name, args: on_tool_call(console, name, args)
-        ):
-            # First token: stop loading, switch to token display
-            if not first_token_arrived[0]:
-                first_token_arrived[0] = True
+    try:
+        with Live(
+            _build_stream_renderable(events, loading_text),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+            auto_refresh=False,
+        ) as live:
+            live_ref[0] = live
+            rotation_timer = threading.Timer(
+                LOADING_INDICATOR_ROTATION_INTERVAL,
+                rotate_loading_indicator,
+                args=(live, loading_text, status_words, first_activity)
+            )
+            rotation_timer.daemon = True
+            rotation_timer.start()
 
-                # Cancel rotation timer
-                if rotation_timer and rotation_timer.is_alive():
-                    rotation_timer.cancel()
-
-                # Clear loading indicator and switch to accumulated text
-                live.update(accumulated)
-
-            # Accumulate tokens
-            accumulated.append(token)
-
-        # Ensure timer is cancelled (handles edge cases)
+            for token in stream:
+                first_activity[0] = True
+                response_chunks.append(token)
+                _append_assistant_chunk(events, token)
+                live.update(
+                    _build_stream_renderable(events, loading_text),
+                    refresh=True,
+                )
+    finally:
+        live_ref[0] = None
         if rotation_timer and rotation_timer.is_alive():
             rotation_timer.cancel()
 
-    return accumulated.plain  # Return full text for markdown rendering
+    if events:
+        console.print(_build_stream_renderable(events))
+
+    return "".join(response_chunks)
 
 
 def main() -> None:
@@ -214,6 +268,11 @@ def main() -> None:
     # Initialize components
     cwd = Path.cwd()
     context = Context.create(cwd=str(cwd))
+    skill_manager = SkillManager(repo_root=cwd)
+    skill_warnings = skill_manager.discover()
+
+    for warning in skill_warnings:
+        console.print(f"[yellow]Skill warning: {warning}[/yellow]")
 
     try:
         llm_client = LLMClient()
@@ -226,12 +285,82 @@ def main() -> None:
     tools.register(ReadTool())
     tools.register(WriteTool())
     tools.register(BashTool())
+    tools.register(LoadSkillTool(skill_manager))
+
+    # Initialize MCP manager and register MCP tools
+    mcp_manager = None
+    if config.mcp.servers:
+        try:
+            # Enable MCP debug mode via environment variable
+            mcp_debug = os.environ.get("MCP_DEBUG", "").lower() in ("1", "true", "yes")
+
+            if mcp_debug:
+                console.print("[dim][MCP] Debug mode enabled[/dim]")
+
+            # Show configured servers
+            enabled_servers = [s.name for s in config.mcp.servers if s.enabled]
+            if enabled_servers:
+                if mcp_debug:
+                    console.print(f"[dim][MCP] Configured servers: {', '.join(enabled_servers)}[/dim]")
+
+            # Convert server configs to dicts for MCPManager
+            servers_config = []
+            for server in config.mcp.servers:
+                servers_config.append({
+                    "name": server.name,
+                    "url": server.url,
+                    "enabled": server.enabled,
+                    "timeout": server.timeout
+                })
+
+            if mcp_debug:
+                console.print("[dim][MCP] Creating MCP manager...[/dim]")
+
+            mcp_manager = MCPManager(servers_config, debug=mcp_debug)
+
+            if mcp_debug:
+                console.print("[dim][MCP] Registering MCP tools...[/dim]")
+
+            mcp_manager.register_tools(tools)
+
+            # Log loaded MCP servers
+            if enabled_servers:
+                if mcp_debug:
+                    console.print(f"[dim][MCP] Successfully loaded {len(enabled_servers)} MCP server(s)[/dim]")
+                else:
+                    console.print(f"[dim]Loaded {len(enabled_servers)} MCP server(s): {', '.join(enabled_servers)}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]Warning: Failed to initialize MCP manager: {e}[/yellow]")
 
     # Create agent
-    agent = Agent(llm_client, tools, context)
+    agent = Agent(llm_client, tools, context, skill_manager=skill_manager)
 
-    # Initialize input helper for bash-like editing
-    input_helper = InputHelper()
+    # Create command registry and register built-in commands
+    registry = CommandRegistry()
+    builtin.register_all(registry)
+
+    # Create execution context for commands
+    cmd_context = {
+        "agent": agent,
+        "mcp_manager": mcp_manager,
+        "tools": tools,
+        "skill_manager": skill_manager,
+        "session_context": context,
+    }
+
+    # Extract command descriptions for completer
+    command_descriptions = {}
+    for cmd in registry.list_commands():
+        command_descriptions[cmd.name] = cmd.short_desc or cmd.description
+
+    # Get command names for completion
+    command_names = registry.get_command_names()
+
+    # Initialize input helper for bash-like editing with command completion
+    input_helper = InputHelper(
+        command_names=command_names,
+        command_descriptions=command_descriptions
+    )
 
     # Print banner
     print_banner(console)
@@ -249,6 +378,10 @@ def main() -> None:
 
                 if not user_input.strip():
                     continue
+
+                # Check for slash commands
+                if registry.execute(user_input, console, cmd_context):
+                    continue  # Command was handled
 
                 if user_input.lower() in ['exit', 'quit']:
                     console.print("\n[yellow]Goodbye![/yellow]")
@@ -287,6 +420,10 @@ def main() -> None:
         # Ensure logger is closed and logs are flushed
         if hasattr(agent, 'logger') and agent.logger:
             agent.logger.close()
+
+        # Close MCP server connections
+        if mcp_manager:
+            mcp_manager.close_all()
 
 
 if __name__ == "__main__":

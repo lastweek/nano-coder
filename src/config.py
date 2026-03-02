@@ -1,6 +1,6 @@
 """Centralized configuration for Nano-Coder."""
 
-from typing import Optional
+from typing import Optional, List
 from pathlib import Path
 import yaml
 from pydantic import Field, field_validator
@@ -77,6 +77,40 @@ class UIConfig(BaseSettings):
     loading_indicator_interval: float = Field(default=0.8, gt=0)
 
 
+class MCPServerConfig(BaseSettings):
+    """Configuration for a single MCP server."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="MCP_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="allow"
+    )
+
+    name: str = Field(description="Unique server name")
+    url: str = Field(description="MCP server URL")
+    enabled: bool = Field(default=True, description="Whether to connect to this server")
+    timeout: int = Field(default=30, description="Request timeout in seconds")
+
+
+class MCPConfig(BaseSettings):
+    """MCP servers configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="MCP_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="allow"
+    )
+
+    servers: List[MCPServerConfig] = Field(
+        default_factory=list,
+        description="List of MCP servers"
+    )
+
+
 class Config:
     """Global configuration container."""
 
@@ -100,6 +134,7 @@ class Config:
         self.logging = self._create_config(LoggingConfig, config_dict.get("logging", {}))
         self.agent = self._create_config(AgentConfig, config_dict.get("agent", {}))
         self.ui = self._create_config(UIConfig, config_dict.get("ui", {}))
+        self.mcp = self._create_mcp_config(config_dict.get("mcp", {}))
 
     @staticmethod
     def _create_config(config_class, yaml_values: dict):
@@ -152,6 +187,25 @@ class Config:
         # Create instance with filtered yaml values
         # Pydantic-settings will still apply env vars for any fields not in filtered_values
         return config_class(**filtered_values)
+
+    @staticmethod
+    def _create_mcp_config(yaml_values: dict) -> MCPConfig:
+        """Create MCP config from yaml values.
+
+        Args:
+            yaml_values: Dict with 'servers' key containing list of server configs
+
+        Returns:
+            MCPConfig instance
+        """
+        servers_list = yaml_values.get("servers", [])
+
+        # Convert each server dict to MCPServerConfig
+        servers = []
+        for server_dict in servers_list:
+            servers.append(MCPServerConfig(**server_dict))
+
+        return MCPConfig(servers=servers)
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> 'Config':

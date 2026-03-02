@@ -51,3 +51,31 @@ class TestContext:
         context.add_message("user", "test")
         context.clear_messages()
         assert len(context.messages) == 0
+
+    def test_activate_skill(self):
+        """Test pinning a skill."""
+        context = Context(cwd=Path("/tmp"))
+        context.activate_skill("pdf")
+        assert context.get_active_skills() == ["pdf"]
+
+    def test_activate_skill_does_not_duplicate(self):
+        """Test pinning the same skill twice keeps one entry."""
+        context = Context(cwd=Path("/tmp"))
+        context.activate_skill("pdf")
+        context.activate_skill("pdf")
+        assert context.get_active_skills() == ["pdf"]
+
+    def test_deactivate_skill(self):
+        """Test unpinning a skill."""
+        context = Context(cwd=Path("/tmp"))
+        context.activate_skill("pdf")
+        context.deactivate_skill("pdf")
+        assert context.get_active_skills() == []
+
+    def test_clear_skills(self):
+        """Test clearing all pinned skills."""
+        context = Context(cwd=Path("/tmp"))
+        context.activate_skill("pdf")
+        context.activate_skill("terraform")
+        context.clear_skills()
+        assert context.get_active_skills() == []

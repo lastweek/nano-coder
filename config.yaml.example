@@ -20,3 +20,20 @@ agent:
 ui:
   enable_streaming: true
   loading_indicator_interval: 0.8
+
+# MCP (Model Context Protocol) Servers
+# External tool servers that nano-coder can connect to
+mcp:
+  servers:
+    - name: deepwiki
+      url: https://mcp.deepwiki.com/mcp  # DeepWiki MCP endpoint; do not append /tools
+      enabled: true
+      timeout: 30
+    - name: example-server
+      url: http://localhost:3000
+      enabled: false  # Disabled by default, enable when you have an MCP server running
+      timeout: 30
+    # Add more MCP servers here:
+    # - name: database
+    #   url: http://localhost:3001
+    #   enabled: true

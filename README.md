@@ -139,6 +139,73 @@ Streaming provides better perceived performance (instant feedback) but requires:
 - OpenAI-compatible API that supports streaming (most do)
 - Slightly more CPU for real-time rendering
 
+## Skills
+
+Nano-Coder supports local Codex-style skill bundles for domain-specific workflows and reusable instructions.
+
+### Discovery Roots
+
+- Repo-local: `.nano-coder/skills`
+- User-global: `~/.nano-coder/skills`
+
+If a repo-local skill and a user-global skill share the same `name`, the repo-local skill wins.
+
+### Skill Layout
+
+```text
+skill-name/
+├── SKILL.md
+├── scripts/
+├── references/
+├── assets/
+└── agents/
+```
+
+Only `SKILL.md` is required. `scripts/`, `references/`, and `assets/` are optional and are inventoried automatically. `agents/` is ignored by the runtime.
+
+### `SKILL.md` Format
+
+Each skill must use YAML frontmatter with `name` and `description`:
+
+```md
+---
+name: pdf
+description: Use for PDF tasks where layout and rendering matter
+metadata:
+  short-description: PDF workflows
+---
+
+Use `pdfplumber`, `pypdf`, and rendered page checks when layout matters.
+```
+
+### Slash Commands
+
+- `/skill` lists discovered skills and whether they are pinned for the session
+- `/skill use <name>` pins a skill for the session
+- `/skill clear <name>` unpins one skill
+- `/skill clear all` unpins all session skills
+- `/skill show <name>` shows metadata, path, body size, and bundled resources
+- `/skill reload` rescans the skill directories from disk
+
+### Agent Behavior
+
+- Skill metadata is always available to the agent in compact form
+- Full skill instructions are only loaded when:
+  - you pin a skill with `/skill use <name>`
+  - the agent calls the built-in `load_skill` tool during the current turn
+- Loading a skill does not execute bundled scripts automatically
+
+### Example Skill Session
+
+```text
+You > explain this PDF form workflow
+
+Agent > I should load the PDF skill for this task.
+  → load_skill(skill_name='pdf')
+
+Here is the PDF-specific workflow to follow...
+```
+
 ## Usage
 
 ```bash
@@ -218,6 +285,7 @@ Nano-Coder uses the **ReAct pattern** (Reasoning + Acting):
 | `read_file` | Read file contents with line numbers |
 | `write_file` | Create or overwrite files |
 | `run_command` | Execute shell commands |
+| `load_skill` | Load a skill's instructions and bundled resource inventory |
 
 ## Next Steps
 

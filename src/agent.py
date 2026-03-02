@@ -11,17 +11,19 @@ from src.config import config
 class Agent:
     """Main agent orchestration using ReAct loop."""
 
-    def __init__(self, llm_client, tools, context):
+    def __init__(self, llm_client, tools, context, skill_manager=None):
         """Initialize the agent.
 
         Args:
             llm_client: LLMClient instance
             tools: ToolRegistry instance
             context: Context instance
+            skill_manager: Optional SkillManager instance
         """
         self.llm = llm_client
         self.tools = tools
         self.context = context
+        self.skill_manager = skill_manager
         self.max_iterations = config.agent.max_iterations
         self.logger = ChatLogger(context.session_id)
 
@@ -38,7 +40,7 @@ class Agent:
             for tool in self.tools._tools.values()
         )
 
-        content = f"""You are a helpful coding assistant with access to tools.
+        self._cached_system_prompt_base = f"""You are a helpful coding assistant with access to tools.
 
 Working directory: {self.context.cwd}
 
@@ -50,14 +52,57 @@ Think step by step. If you make a mistake, try to recover.
 
 Be concise and helpful."""
 
-        self._cached_system_message = {"role": ROLE_SYSTEM, "content": content}
-
         # Tool schemas cached on first use (expensive to build)
         self._cached_tool_schemas = None
 
     def _get_system_message(self) -> Dict:
-        """Get the pre-built system message for the agent."""
-        return self._cached_system_message
+        """Build the system message for the current turn."""
+        return {"role": ROLE_SYSTEM, "content": self._build_system_prompt()}
+
+    def _build_system_prompt(self) -> str:
+        """Build the full system prompt including dynamic skill context."""
+        sections = [self._cached_system_prompt_base]
+
+        skill_catalog = self._build_skill_catalog_section()
+        if skill_catalog:
+            sections.append(skill_catalog)
+
+        pinned_skills = self._build_pinned_skills_section()
+        if pinned_skills:
+            sections.append(pinned_skills)
+
+        return "\n\n".join(section for section in sections if section)
+
+    def _build_skill_catalog_section(self) -> str:
+        """Build the compact catalog of available skills."""
+        if not self.skill_manager:
+            return ""
+
+        skills = self.skill_manager.list_skills()
+        if not skills:
+            return ""
+
+        lines = ["Available skills (load with load_skill when relevant):"]
+        for skill in skills:
+            lines.append(f"- {skill.name}: {skill.short_description}")
+
+        return "\n".join(lines)
+
+    def _build_pinned_skills_section(self) -> str:
+        """Build the pinned-skill prompt blocks for the current session."""
+        if not self.skill_manager:
+            return ""
+
+        pinned_blocks = []
+        for skill_name in self.context.get_active_skills():
+            block = self.skill_manager.format_skill_for_prompt(skill_name)
+            if block:
+                pinned_blocks.append(block)
+
+        if not pinned_blocks:
+            return ""
+
+        return "Pinned skills active for this session:\n\n" + "\n\n".join(pinned_blocks)
 
     def _build_messages(self, user_message: str) -> List[Dict]:
         """Build message list for LLM API call."""

@@ -6,9 +6,9 @@ import shutil
 from pathlib import Path
 from src.context import Context
 from src.tools import ToolRegistry
-from tools.read import ReadTool
-from tools.write import WriteTool
-from tools.bash import BashTool
+from src.tools.read import ReadTool
+from src.tools.write import WriteTool
+from src.tools.bash import BashTool
 
 
 @pytest.fixture

@@ -110,6 +110,23 @@ class ContextConfig(BaseSettings):
         return value
 
 
+class SubagentConfig(BaseSettings):
+    """Local subagent runtime configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SUBAGENTS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"
+    )
+
+    enabled: bool = Field(default=True)
+    max_parallel: int = Field(default=3, ge=1)
+    max_per_turn: int = Field(default=6, ge=1)
+    default_timeout_seconds: int = Field(default=180, ge=1)
+
+
 class MCPServerConfig(BaseSettings):
     """Configuration for a single MCP server."""
 
@@ -168,6 +185,7 @@ class Config:
         self.agent = self._create_config(AgentConfig, config_dict.get("agent", {}))
         self.ui = self._create_config(UIConfig, config_dict.get("ui", {}))
         self.context = self._create_config(ContextConfig, config_dict.get("context", {}))
+        self.subagents = self._create_config(SubagentConfig, config_dict.get("subagents", {}))
         self.mcp = self._create_mcp_config(config_dict.get("mcp", {}))
 
         if self.context.target_usage_after_compaction >= self.context.auto_compact_threshold:

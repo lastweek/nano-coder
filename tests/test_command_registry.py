@@ -4,6 +4,7 @@ import io
 
 from rich.console import Console
 
+from src.commands import builtin
 from src.commands.registry import CommandRegistry, CommandHelpSpec, CommandSubcommandHelp
 
 
@@ -139,3 +140,18 @@ def test_execute_targeted_subcommand_help_renders_without_running_handler():
     text = output.getvalue()
     assert "Command: /skill (show)" in text
     assert "/skill show <name>" in text
+
+
+def test_builtin_subagent_help_renders_manual():
+    """Built-in /subagent help should render the command manual."""
+    registry = CommandRegistry()
+    builtin.register_all(registry)
+    output = io.StringIO()
+    console = create_console(output)
+
+    executed = registry.execute("/subagent help", console, {})
+
+    assert executed is True
+    text = output.getvalue()
+    assert "Command: /subagent" in text
+    assert "/subagent run <task>" in text

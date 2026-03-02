@@ -116,6 +116,12 @@ class TurnProgressDisplay:
             if details.get("success", True):
                 return f"Thinking: finished {details.get('tool_name')}"
             return "Working: tool failed"
+        if event.kind == "subagent_started":
+            return self._format_subagent_status(event, "started")
+        if event.kind == "subagent_completed":
+            return self._format_subagent_status(event, "completed")
+        if event.kind == "subagent_failed":
+            return self._format_subagent_status(event, "failed")
         if event.kind == "answer_stream_started":
             return "Streaming answer"
         if event.kind == "turn_completed":
@@ -197,6 +203,9 @@ class TurnProgressDisplay:
                 line += f" ({details.get('error')})"
             return line
 
+        if event.kind.startswith("subagent_"):
+            return self._format_subagent_event_line(event, summary=summary)
+
         if event.kind == "answer_stream_started":
             return None
 
@@ -244,3 +253,37 @@ class TurnProgressDisplay:
         if len(compact) > 36:
             compact = compact[:33] + "..."
         return compact
+
+    def _format_subagent_status(self, event: TurnActivityEvent, state: str) -> str:
+        """Format subagent status for the activity bar."""
+        label = event.details.get("label", "")
+        if state == "started":
+            return f"Working: running subagent {label}"
+        if state == "completed":
+            return f"Thinking: finished subagent {label}"
+        if state == "failed":
+            return f"Working: subagent failed {label}"
+        return ""
+
+    def _format_subagent_event_line(self, event: TurnActivityEvent, *, summary: bool) -> Optional[str]:
+        """Format subagent event for the feed."""
+        label = event.details.get("label", "")
+        state = event.kind.replace("subagent_", "")
+
+        if state == "started":
+            return None if summary else f"Subagent started: {label}"
+
+        duration = float(event.details.get("duration_s", 0.0))
+        if state == "completed":
+            if summary:
+                return f"Subagent finished: {label}"
+            return f"Subagent finished: {label} ({duration:.2f}s)"
+
+        if state == "failed":
+            line = f"Subagent failed: {label} ({duration:.2f}s)"
+            if self.skill_debug and event.details.get("error"):
+                line += f" ({event.details.get('error')})"
+            return line
+
+        return None
+

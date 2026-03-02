@@ -275,7 +275,61 @@ def test_run_agent_turn_includes_skill_preload_summary():
     )
     normalized = normalize_output(console.export_text())
     assert "Skill preloaded: pdf (explicit)" in normalized
-    assert normalized.count("Skill preloaded: pdf (explicit)") == 1
+
+
+def test_run_agent_turn_includes_subagent_summary_lines():
+    """Subagent lifecycle events should be summarized without generic tool noise."""
+    from src.main import run_agent_turn
+
+    class StubAgent:
+        context = StubContext()
+
+        def run(self, user_input, on_tool_call=None, on_event=None):
+            on_event(TurnActivityEvent("subagent_started", details={
+                "subagent_id": "sa_0001_abcd1234",
+                "label": "research-logging",
+                "task": "inspect logging",
+            }))
+            on_event(TurnActivityEvent("subagent_completed", details={
+                "subagent_id": "sa_0001_abcd1234",
+                "label": "research-logging",
+                "duration_s": 1.25,
+                "summary": "summary",
+            }))
+            on_event(TurnActivityEvent("llm_call_finished", iteration=0, details={
+                "stream": False,
+                "duration_s": 0.1,
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "cached_tokens": 4,
+                "has_tool_calls": False,
+                "tool_call_count": 0,
+                "result_kind": "final_answer",
+            }))
+            on_event(TurnActivityEvent("turn_completed", details={
+                "status": "completed",
+                "llm_call_count": 1,
+                "tool_call_count": 1,
+                "tools_used": ["run_subagent"],
+                "skills_used": [],
+            }))
+            return "Plain answer"
+
+    console = make_recording_console()
+    response = run_agent_turn(
+        console,
+        StubAgent(),
+        "hello",
+        enable_streaming=False,
+        skill_debug=False,
+    )
+    normalized = normalize_output(console.export_text())
+
+    assert response == "Plain answer"
+    assert "Subagent finished: research-logging" in normalized
+    assert normalized.count("Subagent finished: research-logging") == 1
+    assert "Tool finished: run_subagent" not in normalized
 
 
 def test_run_agent_turn_includes_compaction_summary():

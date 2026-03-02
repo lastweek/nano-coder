@@ -10,6 +10,7 @@ The project is built for practical repo work: you get a live activity feed while
 - Tool-based code tasks with `read_file`, `write_file`, and `run_command`
 - Streaming answers plus a live activity feed while the agent is thinking
 - MCP support for external tool servers such as DeepWiki
+- Local subagents for bounded parallel delegated repo tasks
 - Local skill system with cataloging, pinning, and on-demand loading
 - Per-session logging with `session.json`, `llm.log`, and `events.jsonl`
 - `/context` command for estimating next-call baseline context usage
@@ -86,6 +87,10 @@ MCP servers are configured in `config.yaml` and loaded at startup. Their tools a
 ### Skills
 
 Skills provide reusable local instructions through `SKILL.md` bundles. Nano-Coder keeps a compact skill catalog in context and loads full skill bodies only when they are pinned, explicitly requested with `$skill-name`, or loaded by the agent with `load_skill`.
+
+### Subagents
+
+Nano-Coder can delegate independent repo subtasks to fresh local subagents with `run_subagent`. Child agents run in the same repository with their own context and nested session logs, but they do not inherit the parent conversation history or spawn additional subagents.
 
 ### Logging
 
@@ -200,6 +205,7 @@ Nano-Coder supports built-in slash commands that bypass the agent:
 - `/mcp` - inspect MCP servers and MCP-provided tools
 - `/skill` - list, pin, unpin, inspect, and reload skills
 - `/context` - estimate next-call baseline context usage
+- `/subagent` - inspect or run local delegated child agents
 
 Each slash command also supports built-in manual help:
 
@@ -237,6 +243,16 @@ For the full execution model, summary lifecycle, and logging flow, see [doc/cont
 ### `/context`
 
 `/context` estimates the baseline payload for the next LLM call before any new user message is added. The numbers are approximate and exclude the next user message and any explicit `$skill-name` preload for that future turn.
+
+### `/subagent`
+
+Supported forms:
+
+- `/subagent`
+- `/subagent help`
+- `/subagent help <subcommand>`
+- `/subagent run <task>`
+- `/subagent show <id>`
 
 ## Skills
 
@@ -325,6 +341,7 @@ Each CLI run writes a session directory under `logs/`:
 - `llm.log` - full human-readable execution timeline
 - `events.jsonl` - structured event stream
 - `artifacts/` - spilled large non-LLM payloads
+- `subagents/` - nested child-agent session directories when delegation is used
 
 Convenience symlinks:
 
@@ -357,14 +374,13 @@ Use `.env` for real credentials and keep tracked files on placeholders only.
 ```bash
 pip install -r requirements-dev.txt
 pytest
-pytest --cov=src --cov=tools --cov-report=html
+pytest --cov=src --cov-report=html
 ```
 
 ### Key directories
 
 ```text
-src/                core CLI, agent, config, logging, skills, commands
-tools/              built-in tool implementations
+src/                core CLI, agent, config, logging, commands, and built-in tools
 tests/              pytest suite
 .githooks/          local secret guard hooks
 .nano-coder/skills/ optional repo-local skills

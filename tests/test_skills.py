@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 from src.context import Context
-from src.skills import LoadSkillTool, SkillManager
+from src.skills import SkillManager
+from src.tools.skill import LoadSkillTool
 
 
 def write_skill(skill_dir: Path, frontmatter: str, body: str = "Use the skill.\n") -> Path:

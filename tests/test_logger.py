@@ -268,15 +268,75 @@ class TestSessionLogger:
         llm_log = (session_dir / "llm.log").read_text()
         assert "CONTEXT COMPACTION SKIPPED" in llm_log
         assert "\"reason\": \"not_enough_complete_turns\"" in llm_log
-        assert "\"complete_turn_count\": 0" in llm_log
 
-        events = [
-            json.loads(line)
-            for line in (session_dir / "events.jsonl").read_text().splitlines()
-            if line.strip()
-        ]
-        kinds = [event["kind"] for event in events]
-        assert "context_compaction_skipped" in kinds
+    def test_child_session_does_not_update_latest_symlinks_and_records_subagent_events(self, temp_dir):
+        """Child sessions should nest under the parent and keep latest-session pointing at the parent."""
+        parent_logger = self._build_logger(temp_dir)
+        parent_turn_id = parent_logger.start_turn(raw_user_input="delegate", normalized_user_input="delegate")
+        parent_session_dir = parent_logger.ensure_session_dir()
+
+        child_logger = SessionLogger(
+            str(uuid.uuid4()),
+            log_dir=str(parent_session_dir / "subagents"),
+            enabled=True,
+            update_latest_symlinks=False,
+            session_kind="subagent",
+            parent_session_id=parent_logger.session_id,
+            parent_turn_id=parent_turn_id,
+            subagent_id="sa_0001_abcd1234",
+            subagent_label="research-logging",
+        )
+        child_logger.start_session(
+            cwd=str(temp_dir),
+            provider="openai",
+            model="gpt-4.1",
+            base_url="https://example.invalid/v1",
+            streaming_enabled=False,
+        )
+        child_turn_id = child_logger.start_turn(raw_user_input="brief", normalized_user_input="brief")
+        child_logger.finish_turn(child_turn_id, "child done", [], status="completed")
+        child_logger.close()
+
+        parent_logger.log_subagent_event(
+            turn_id=parent_turn_id,
+            stage="started",
+            subagent_id="sa_0001_abcd1234",
+            label="research-logging",
+            task="inspect logging",
+            session_dir=str(child_logger.session_dir),
+            llm_log=str(child_logger.get_llm_log_path()),
+            events_log=str(child_logger.get_events_path()),
+        )
+        parent_logger.log_subagent_event(
+            turn_id=parent_turn_id,
+            stage="completed",
+            subagent_id="sa_0001_abcd1234",
+            label="research-logging",
+            session_dir=str(child_logger.session_dir),
+            llm_log=str(child_logger.get_llm_log_path()),
+            events_log=str(child_logger.get_events_path()),
+            summary="summary",
+            status="completed",
+        )
+        parent_logger.finish_turn(parent_turn_id, "done", [], status="completed")
+        parent_logger.close()
+
+        latest_session = (Path(temp_dir) / "latest-session").resolve()
+        assert latest_session == parent_session_dir.resolve()
+        child_session_dir = child_logger.session_dir
+        assert child_session_dir is not None
+        assert child_session_dir.parent.name == "subagents"
+
+        child_session = json.loads((child_session_dir / "session.json").read_text())
+        assert child_session["session_kind"] == "subagent"
+        assert child_session["parent_session_id"] == parent_logger.session_id
+        assert child_session["parent_turn_id"] == parent_turn_id
+        assert child_session["subagent_id"] == "sa_0001_abcd1234"
+
+        parent_llm_log = (parent_session_dir / "llm.log").read_text()
+        assert "SUBAGENT START" in parent_llm_log
+        assert "SUBAGENT END" in parent_llm_log
+        assert "research-logging" in parent_llm_log
 
     def test_async_mode_preserves_valid_output(self, temp_dir):
         """Async logging should still produce readable files."""

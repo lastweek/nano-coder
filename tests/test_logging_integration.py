@@ -9,7 +9,7 @@ from src.config import config
 from src.context import Context
 from src.llm import LLMClient
 from src.tools import ToolRegistry
-from tools.read import ReadTool
+from src.tools.read import ReadTool
 
 
 class TestLoggingIntegration:

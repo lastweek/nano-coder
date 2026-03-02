@@ -1,7 +1,7 @@
 """Test BashTool."""
 
 import pytest
-from tools.bash import BashTool
+from src.tools.bash import BashTool
 from src.context import Context
 
 

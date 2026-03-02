@@ -10,7 +10,8 @@ from src.commands import builtin
 from src.commands.registry import CommandRegistry
 from src.config import Config
 from src.context import Context
-from src.skills import LoadSkillTool, SkillManager
+from src.skills import SkillManager
+from src.tools.skill import LoadSkillTool
 from src.tools import ToolRegistry
 
 

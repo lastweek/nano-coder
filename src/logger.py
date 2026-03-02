@@ -12,12 +12,20 @@ from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional
 
 from src.config import config
-from src.tools import REQUEST_KIND_AGENT_TURN, REQUEST_KIND_CONTEXT_COMPACTION
+from src.tools import (
+    REQUEST_KIND_AGENT_TURN,
+    REQUEST_KIND_CONTEXT_COMPACTION,
+)
 
 
 SESSION_HEADER_RULE = "=" * 80
 SECTION_RULE = "-" * 80
 ARTIFACT_SPILL_THRESHOLD = 8192
+
+
+def _sanitize_fragment(value: str) -> str:
+    """Convert a freeform label into a filesystem-safe fragment."""
+    return "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in value.strip()).strip("-") or "subagent"
 
 
 @dataclass
@@ -45,6 +53,12 @@ class SessionLogger:
         enabled: Optional[bool] = None,
         buffer_size: Optional[int] = None,
         async_mode: Optional[bool] = None,
+        update_latest_symlinks: bool = True,
+        session_kind: str = "primary",
+        parent_session_id: Optional[str] = None,
+        parent_turn_id: Optional[int] = None,
+        subagent_id: Optional[str] = None,
+        subagent_label: Optional[str] = None,
     ):
         """Initialize the logger."""
         self.session_id = session_id
@@ -68,10 +82,21 @@ class SessionLogger:
         self.enabled = enabled
         self.async_mode = async_mode
         self.buffer_size = buffer_size
+        self.update_latest_symlinks = update_latest_symlinks
+        self.session_kind = session_kind
+        self.parent_session_id = parent_session_id
+        self.parent_turn_id = parent_turn_id
+        self.subagent_id = subagent_id
+        self.subagent_label = subagent_label
 
         self._lock = Lock()
         self._timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self._session_dir_name = f"session-{self._timestamp}-{self.session_id[:8]}"
+        if self.session_kind == "subagent":
+            label_fragment = _sanitize_fragment(self.subagent_label or "subagent")
+            id_fragment = _sanitize_fragment((self.subagent_id or self.session_id)[:8])
+            self._session_dir_name = f"subagent-{label_fragment}-{id_fragment}"
+        else:
+            self._session_dir_name = f"session-{self._timestamp}-{self.session_id[:8]}"
         self.session_dir: Optional[Path] = None
         self._artifacts_dir: Optional[Path] = None
         self._session_json_path: Optional[Path] = None
@@ -220,6 +245,28 @@ class SessionLogger:
             return
 
         self._submit_write(self._record_context_compaction_event, turn_id, stage, details)
+
+    def log_subagent_event(
+        self,
+        *,
+        turn_id: Optional[int],
+        stage: str,
+        subagent_id: str,
+        label: str,
+        **details: Any,
+    ) -> None:
+        """Log a subagent lifecycle event to both parent outputs."""
+        if not self.enabled:
+            return
+
+        self._submit_write(
+            self._record_subagent_event,
+            turn_id,
+            stage,
+            subagent_id,
+            label,
+            details,
+        )
 
     def log_skill_event(self, turn_id: int, event: str, **details: Any) -> None:
         """Log a skill event to events.jsonl and llm.log."""
@@ -401,12 +448,31 @@ class SessionLogger:
         self._llm_log_path = self.session_dir / "llm.log"
         self._events_path = self.session_dir / "events.jsonl"
 
-        self._update_symlink(self.log_dir / "latest-session", self.session_dir)
-        self._update_symlink(self.log_dir / "latest.log", self._llm_log_path)
+        if self.update_latest_symlinks:
+            self._update_symlink(self.log_dir / "latest-session", self.session_dir)
+            self._update_symlink(self.log_dir / "latest.log", self._llm_log_path)
 
         self._initialized = True
         self._write_session_manifest()
         self._record_session_started()
+
+    def ensure_session_dir(self) -> Path:
+        """Ensure the session directory exists and return it."""
+        self._ensure_initialized()
+        assert self.session_dir is not None
+        return self.session_dir
+
+    def get_llm_log_path(self) -> Path:
+        """Return the llm.log path, creating the session directory if needed."""
+        self._ensure_initialized()
+        assert self._llm_log_path is not None
+        return self._llm_log_path
+
+    def get_events_path(self) -> Path:
+        """Return the events.jsonl path, creating the session directory if needed."""
+        self._ensure_initialized()
+        assert self._events_path is not None
+        return self._events_path
 
     def _update_symlink(self, link_path: Path, target: Path) -> None:
         """Create or refresh a symlink when supported."""
@@ -418,6 +484,27 @@ class SessionLogger:
         except OSError:
             pass
 
+    def _build_session_parent_fields(self) -> Dict[str, Any]:
+        """Build common parent/session fields used across logging."""
+        return {
+            "session_kind": self.session_kind,
+            "parent_session_id": self.parent_session_id,
+            "parent_turn_id": self.parent_turn_id,
+            "subagent_id": self.subagent_id,
+            "subagent_label": self.subagent_label,
+        }
+
+    def _build_session_parent_lines(self) -> List[str]:
+        """Build formatted parent/session metadata lines for display."""
+        return [
+            f"Session ID: {self.session_id}",
+            f"Session Kind: {self.session_kind}",
+            f"Parent Session ID: {self.parent_session_id}",
+            f"Parent Turn ID: {self.parent_turn_id}",
+            f"Subagent ID: {self.subagent_id}",
+            f"Subagent Label: {self.subagent_label}",
+        ]
+
     def _write_session_manifest(self) -> None:
         """Write session.json."""
         self._ensure_initialized()
@@ -428,6 +515,7 @@ class SessionLogger:
             "timeline_format_version": 2,
             "primary_debug_log": "llm.log",
             "session_id": self.session_id,
+            **self._build_session_parent_fields(),
             "started_at": self._session_started_at,
             "ended_at": self._session_ended_at,
             "status": self._session_status,
@@ -520,6 +608,7 @@ class SessionLogger:
         self._append_event(
             "session_started",
             timeline_seq,
+            **self._build_session_parent_fields(),
             cwd=self._session_metadata["cwd"],
             provider=self._session_metadata["provider"],
             model=self._session_metadata["model"],
@@ -530,8 +619,7 @@ class SessionLogger:
             rule=SESSION_HEADER_RULE,
             header=f"STEP {timeline_seq:04d} | SESSION START",
             timestamp=timestamp,
-            metadata_lines=[
-                f"Session ID: {self.session_id}",
+            metadata_lines=self._build_session_parent_lines() + [
                 f"CWD: {self._session_metadata['cwd']}",
                 f"Provider: {self._session_metadata['provider']}",
                 f"Model: {self._session_metadata['model']}",
@@ -690,6 +778,51 @@ class SessionLogger:
             rule=SECTION_RULE,
             header=header,
             timestamp=timestamp,
+            sections=self._append_json_block("DETAILS", details),
+        )
+
+    def _record_subagent_event(
+        self,
+        turn_id: Optional[int],
+        stage: str,
+        subagent_id: str,
+        label: str,
+        details: Dict[str, Any],
+    ) -> None:
+        """Write a subagent lifecycle block and structured event."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        event_kind = f"subagent_{stage}"
+        self._append_event(
+            event_kind,
+            timeline_seq,
+            turn_id=turn_id,
+            subagent_id=subagent_id,
+            label=label,
+            **details,
+        )
+
+        stage_label = {
+            "started": "SUBAGENT START",
+            "completed": "SUBAGENT END",
+            "failed": "SUBAGENT FAILED",
+        }.get(stage, "SUBAGENT")
+        if turn_id is None:
+            header = f"STEP {timeline_seq:04d} | {stage_label}"
+        else:
+            header = f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | {stage_label}"
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=header,
+            timestamp=timestamp,
+            metadata_lines=[
+                f"Subagent ID: {subagent_id}",
+                f"Label: {label}",
+                f"Session Dir: {details.get('session_dir')}",
+                f"LLM Log: {details.get('llm_log')}",
+                f"Events Log: {details.get('events_log')}",
+            ],
             sections=self._append_json_block("DETAILS", details),
         )
 

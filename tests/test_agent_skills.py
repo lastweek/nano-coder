@@ -8,7 +8,8 @@ from types import SimpleNamespace
 from src.agent import Agent
 from src.config import config
 from src.context import CompactedContextSummary, Context
-from src.skills import LoadSkillTool, SkillManager
+from src.skills import SkillManager
+from src.tools.skill import LoadSkillTool
 from src.tools import ToolRegistry
 
 

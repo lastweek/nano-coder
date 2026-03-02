@@ -19,18 +19,16 @@ from rich.live import Live
 
 from src.context import Context
 from src.llm import LLMClient
-from src.tools import ToolRegistry
-from tools.read import ReadTool
-from tools.write import WriteTool
-from tools.bash import BashTool
 from src.agent import Agent
 from src.metrics_display import display_metrics
 from src.config import config
 from src.mcp import MCPManager
-from src.skills import LoadSkillTool, SkillManager
+from src.skills import SkillManager
 from src.commands import CommandRegistry
 from src.commands import builtin
 from src.turn_display import TurnProgressDisplay
+from src.subagents import SubagentManager
+from src.tool_builder import build_tool_registry
 
 REQUEST_TYPE_STREAMING = "streaming"
 REQUEST_TYPE_NON_STREAMING = "non-streaming"
@@ -198,13 +196,6 @@ def main() -> None:
         console.print(f"[red]Error initializing LLM client: {e}[/red]")
         sys.exit(1)
 
-    # Register tools
-    tools = ToolRegistry()
-    tools.register(ReadTool())
-    tools.register(WriteTool())
-    tools.register(BashTool())
-    tools.register(LoadSkillTool(skill_manager))
-
     # Initialize MCP manager and register MCP tools
     mcp_manager = None
     if config.mcp.servers:
@@ -236,11 +227,6 @@ def main() -> None:
 
             mcp_manager = MCPManager(servers_config, debug=mcp_debug)
 
-            if mcp_debug:
-                console.print("[dim][MCP] Registering MCP tools...[/dim]")
-
-            mcp_manager.register_tools(tools)
-
             # Log loaded MCP servers
             if enabled_servers:
                 if mcp_debug:
@@ -250,8 +236,22 @@ def main() -> None:
         except Exception as e:
             console.print(f"[yellow]Warning: Failed to initialize MCP manager: {e}[/yellow]")
 
+    subagent_manager = SubagentManager()
+    tools = build_tool_registry(
+        skill_manager=skill_manager,
+        mcp_manager=mcp_manager,
+        subagent_manager=subagent_manager,
+        include_subagent_tool=config.subagents.enabled,
+    )
+
     # Create agent
-    agent = Agent(llm_client, tools, context, skill_manager=skill_manager)
+    agent = Agent(
+        llm_client,
+        tools,
+        context,
+        skill_manager=skill_manager,
+        subagent_manager=subagent_manager,
+    )
 
     # Create command registry and register built-in commands
     registry = CommandRegistry()
@@ -264,6 +264,7 @@ def main() -> None:
         "tools": tools,
         "skill_manager": skill_manager,
         "session_context": context,
+        "subagent_manager": subagent_manager,
     }
 
     # Extract command descriptions for completer

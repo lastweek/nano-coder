@@ -17,7 +17,16 @@ from src.turn_activity import TurnActivityCallback, TurnActivityEvent
 class Agent:
     """Main agent orchestration using ReAct loop."""
 
-    def __init__(self, llm_client, tools, context, skill_manager=None):
+    def __init__(
+        self,
+        llm_client,
+        tools,
+        context,
+        skill_manager=None,
+        logger: Optional[SessionLogger] = None,
+        request_kind: str = REQUEST_KIND_AGENT_TURN,
+        subagent_manager=None,
+    ):
         """Initialize the agent.
 
         Args:
@@ -30,9 +39,11 @@ class Agent:
         self.tools = tools
         self.context = context
         self.skill_manager = skill_manager
+        self.request_kind = request_kind
+        self.subagent_manager = subagent_manager
         current_config = Config.load()
         self.max_iterations = current_config.agent.max_iterations
-        self.logger = SessionLogger(context.session_id)
+        self.logger = logger or SessionLogger(context.session_id)
         self.logger.start_session(
             cwd=self.context.cwd,
             provider=getattr(self.llm, "provider", "unknown"),
@@ -76,6 +87,10 @@ When asked to do something that requires tools, use them. Always explain what yo
 Think step by step. If you make a mistake, try to recover.
 
 Be concise and helpful."""
+        if self.tools.get("run_subagent") is not None:
+            self._cached_system_prompt_base += (
+                "\n\nWhen a task can be split into independent repo subtasks, you may delegate it with run_subagent."
+            )
 
         # Tool schemas cached on first use (expensive to build)
         self._cached_tool_schemas = None
@@ -394,6 +409,14 @@ Be concise and helpful."""
 
         return message
 
+    def _tool_result_message(self, tool_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the replayable tool result message appended to the conversation."""
+        return {
+            "role": ROLE_TOOL,
+            "tool_call_id": tool_id,
+            "content": json.dumps(result),
+        }
+
     def _execute_tool_call(self, tool_call: Dict, parsed_args: Dict) -> Tuple[Dict, Dict]:
         """Execute a single tool call.
 
@@ -424,13 +447,89 @@ Be concise and helpful."""
         except Exception as e:
             result = {"error": f"Error executing tool: {e}"}
 
-        # Format as tool result message and return both message and parsed result
-        tool_result_message = {
-            "role": ROLE_TOOL,
-            "tool_call_id": tool_id,
-            "content": json.dumps(result)
-        }
-        return tool_result_message, result
+        return self._tool_result_message(tool_id, result), result
+
+    def _process_subagent_tool_batch(
+        self,
+        tool_calls: List[Dict],
+        messages: List[Dict],
+        turn_id: int,
+        iteration: int,
+        on_tool_call: Optional[Callable],
+        on_event: Optional[TurnActivityCallback],
+        tools_used: Optional[List[str]],
+    ) -> int:
+        """Process one consecutive run_subagent batch with bounded parallel fan-out."""
+        if self.subagent_manager is None:
+            for tool_call in tool_calls:
+                parsed_args = json.loads(tool_call["arguments"])
+                result_content = {"error": "Subagent runtime is not available"}
+                messages.append(self._tool_result_message(tool_call["id"], result_content))
+                self.logger.log_tool_result(
+                    turn_id=turn_id,
+                    iteration=iteration,
+                    tool_name="run_subagent",
+                    result=result_content,
+                    tool_call_id=tool_call["id"],
+                )
+            return len(tool_calls)
+
+        pending_results: List[Tuple[Dict[str, Any], Dict[str, Any] | None, Any | None]] = []
+        valid_tool_calls: List[Dict[str, Any]] = []
+        requests = []
+
+        for tool_call in tool_calls:
+            parsed_args = json.loads(tool_call["arguments"])
+            tool_call_id = tool_call["id"]
+            if on_tool_call is not None:
+                on_tool_call("run_subagent", parsed_args)
+
+            self.logger.log_tool_call(
+                turn_id=turn_id,
+                iteration=iteration,
+                tool_name="run_subagent",
+                arguments=parsed_args,
+                tool_call_id=tool_call_id,
+            )
+
+            if tools_used is not None and "run_subagent" not in tools_used:
+                tools_used.append("run_subagent")
+
+            try:
+                request = self.subagent_manager.build_request(parsed_args)
+            except ValueError as exc:
+                pending_results.append((tool_call, parsed_args, {"error": str(exc)}))
+                continue
+
+            pending_results.append((tool_call, parsed_args, None))
+            valid_tool_calls.append(tool_call)
+            requests.append(request)
+
+        subagent_results = self.subagent_manager.run_batch(
+            self,
+            requests,
+            parent_turn_id=turn_id,
+            iteration=iteration,
+            on_event=on_event,
+        ) if requests else []
+        result_iter = iter(subagent_results)
+
+        for tool_call, _parsed_args, immediate_error in pending_results:
+            if immediate_error is not None:
+                result_content = immediate_error
+            else:
+                result_content = self.subagent_manager.result_to_payload(next(result_iter))
+
+            messages.append(self._tool_result_message(tool_call["id"], result_content))
+            self.logger.log_tool_result(
+                turn_id=turn_id,
+                iteration=iteration,
+                tool_name="run_subagent",
+                result=result_content,
+                tool_call_id=tool_call["id"],
+            )
+
+        return len(tool_calls)
 
     def _process_tool_calls(
         self,
@@ -451,11 +550,30 @@ Be concise and helpful."""
             on_tool_call: Optional callback for notification
         """
         processed_count = 0
-        for tool_call in tool_calls:
-            processed_count += 1
+        index = 0
+        while index < len(tool_calls):
+            tool_call = tool_calls[index]
             parsed_args = json.loads(tool_call["arguments"])
             tool_name = tool_call["name"]
             tool_call_id = tool_call["id"]
+
+            if tool_name == "run_subagent":
+                batch_calls: List[Dict[str, Any]] = []
+                while index < len(tool_calls) and tool_calls[index]["name"] == "run_subagent":
+                    batch_calls.append(tool_calls[index])
+                    index += 1
+                processed_count += self._process_subagent_tool_batch(
+                    batch_calls,
+                    messages,
+                    turn_id,
+                    iteration,
+                    on_tool_call,
+                    on_event,
+                    tools_used,
+                )
+                continue
+
+            processed_count += 1
             if tools_used is not None and tool_name not in tools_used:
                 tools_used.append(tool_name)
 
@@ -534,6 +652,7 @@ Be concise and helpful."""
                 self._emit_skill_event(turn_id, skill_event_name, **event_details)
                 cli_details = {key: value for key, value in event_details.items() if key != "iteration"}
                 self._emit_turn_event(on_event, cli_event_name, iteration=iteration, **cli_details)
+            index += 1
         return processed_count
 
     def _finalize_response(self, user_message: str, final_response: str) -> None:
@@ -696,7 +815,7 @@ Be concise and helpful."""
                         "turn_id": turn_id,
                         "iteration": iteration,
                         "stream": False,
-                        "request_kind": REQUEST_KIND_AGENT_TURN,
+                        "request_kind": self.request_kind,
                     },
                 )
                 metrics.iteration = iteration
@@ -802,7 +921,7 @@ Be concise and helpful."""
                         "turn_id": turn_id,
                         "iteration": iteration,
                         "stream": True,
-                        "request_kind": REQUEST_KIND_AGENT_TURN,
+                        "request_kind": self.request_kind,
                     },
                 ):
                     if "role" in chunk:

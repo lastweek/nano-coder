@@ -27,6 +27,12 @@ context:
   target_usage_after_compaction: 0.60
   min_recent_turns: 6
 
+subagents:
+  enabled: true
+  max_parallel: 3
+  max_per_turn: 6
+  default_timeout_seconds: 180
+
 # MCP (Model Context Protocol) Servers
 # External tool servers that nano-coder can connect to
 mcp:

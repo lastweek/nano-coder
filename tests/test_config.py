@@ -43,6 +43,15 @@ class TestConfigDefaults:
         assert config.ui.enable_streaming is True
         assert config.ui.loading_indicator_interval == 0.8
 
+    def test_subagent_defaults(self, monkeypatch):
+        """Test subagent config default values."""
+        monkeypatch.delenv("SUBAGENTS_ENABLED", raising=False)
+        config = Config()
+        assert config.subagents.enabled is True
+        assert config.subagents.max_parallel == 3
+        assert config.subagents.max_per_turn == 6
+        assert config.subagents.default_timeout_seconds == 180
+
 
 class TestConfigValidation:
     """Test configuration validation."""
@@ -110,6 +119,7 @@ class TestConfigSingleton:
         assert hasattr(config, 'logging')
         assert hasattr(config, 'agent')
         assert hasattr(config, 'ui')
+        assert hasattr(config, 'subagents')
         assert isinstance(config.llm, LLMConfig)
         assert isinstance(config.logging, LoggingConfig)
 

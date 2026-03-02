@@ -20,6 +20,9 @@ TurnActivityKind = Literal[
     "llm_call_finished",
     "tool_call_started",
     "tool_call_finished",
+    "subagent_started",
+    "subagent_completed",
+    "subagent_failed",
     "answer_stream_started",
     "turn_completed",
     "turn_error",
@@ -48,6 +51,9 @@ class TurnActivityEvent:
     - `tool_call_started`: `tool_name`, `tool_call_id`, `arguments`
     - `tool_call_finished`: `tool_name`, `tool_call_id`, `arguments`, `success`,
       `duration_s`, optional `error`
+    - `subagent_started`: `subagent_id`, `label`, `task`
+    - `subagent_completed`: `subagent_id`, `label`, `duration_s`, `summary`
+    - `subagent_failed`: `subagent_id`, `label`, `duration_s`, `error`
     - `turn_completed`: `status`, `llm_call_count`, `tool_call_count`,
       `tools_used`, `skills_used`
     - `turn_error`: `phase`, `message`

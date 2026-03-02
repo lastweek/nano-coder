@@ -2,17 +2,15 @@
 
 import os
 import sys
-import threading
-import random
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional
 
 # Add parent directory to path to allow imports when running directly
 if __name__ == "__main__" and __file__:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
-from rich.console import Console, Group
+from rich.console import Console
 from src.input_helper import InputHelper
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -32,19 +30,11 @@ from src.mcp import MCPManager
 from src.skills import LoadSkillTool, SkillManager
 from src.commands import CommandRegistry
 from src.commands import builtin
+from src.turn_display import TurnProgressDisplay
 
-# Constants for loading indicator
-LOADING_INDICATOR_ROTATION_INTERVAL = 0.8  # seconds between status word changes
-DEFAULT_LOADING_STATUS_WORDS = [
-    "Thinking...",
-    "Processing...",
-    "Analyzing...",
-    "Generating...",
-    "Working...",
-    "Computing..."
-]
 REQUEST_TYPE_STREAMING = "streaming"
 REQUEST_TYPE_NON_STREAMING = "non-streaming"
+DEBUG_ENABLED_VALUES = ("1", "true", "yes")
 
 
 def print_banner(console: Console) -> None:
@@ -80,161 +70,74 @@ def print_banner(console: Console) -> None:
     console.print("[dim]Type 'exit' or 'quit' to leave[/dim]\n")
 
 
-def on_tool_call(console: Console, tool_name: str, args: dict) -> None:
-    """Callback when a tool is called."""
-    console.print(f"[dim]{_format_tool_call_line(tool_name, args)}[/dim]")
+def _final_response_from_context(agent, fallback: str) -> str:
+    """Prefer the finalized assistant response stored in context."""
+    messages = agent.context.get_messages()
+    if messages and messages[-1]["role"] == "assistant":
+        return messages[-1]["content"]
+    return fallback
 
 
-def _format_tool_call_line(tool_name: str, args: dict) -> str:
-    """Format a tool call for display."""
-    args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
-    return f"  → {tool_name}({args_str})"
+def run_agent_turn(
+    console: Console,
+    agent,
+    user_input: str,
+    *,
+    enable_streaming: bool,
+    skill_debug: bool,
+) -> str:
+    """Run one agent turn with a live chronological activity feed."""
+    request_type = REQUEST_TYPE_STREAMING if enable_streaming else REQUEST_TYPE_NON_STREAMING
+    display = TurnProgressDisplay(skill_debug=skill_debug, request_type=request_type)
+    response = ""
 
+    live_ref: list[Optional[Live]] = [None]
+    animate_live = console.is_terminal
 
-def _append_assistant_chunk(events: List[Tuple[str, str]], chunk: str) -> None:
-    """Append streamed assistant text while preserving chronology."""
-    if not chunk:
-        return
-
-    if events and events[-1][0] == "assistant":
-        event_type, content = events[-1]
-        events[-1] = (event_type, content + chunk)
-        return
-
-    events.append(("assistant", chunk))
-
-
-def _build_stream_renderable(
-    events: List[Tuple[str, str]],
-    loading_text: Optional[Text] = None,
-):
-    """Build the current streaming preview renderable."""
-    if not events:
-        return loading_text if loading_text is not None else Text("")
-
-    renderables = []
-    for event_type, content in events:
-        if event_type == "assistant":
-            renderables.append(Markdown(content))
-        elif event_type == "tool":
-            renderables.append(Text(content, style="dim"))
-
-    return Group(*renderables)
-
-
-def create_loading_indicator() -> tuple:
-    """Create a loading indicator with rotating status words.
-
-    Returns:
-        tuple: (Text object, list of status words)
-    """
-    return Text(DEFAULT_LOADING_STATUS_WORDS[0], style="dim italic"), DEFAULT_LOADING_STATUS_WORDS
-
-
-def rotate_loading_indicator(
-    live: Live,
-    text_obj: Text,
-    status_words: List[str],
-    first_activity: List[bool]
-) -> None:
-    """Rotate loading indicator status words via background timer.
-
-    Args:
-        live: Rich Live display instance
-        text_obj: Current Text object being displayed
-        status_words: List of status word strings
-        first_activity: Mutable list [bool] to track first output activity
-    """
-    # Stop once the stream has produced visible activity.
-    if first_activity[0]:
-        return
-
-    # Pick random status word (different from current)
-    current_text = text_obj.plain
-    available_words = [w for w in status_words if w != current_text]
-    new_word = random.choice(available_words)
-
-    # Update display
-    text_obj.plain = new_word
-    live.update(text_obj, refresh=True)
-
-    # Schedule next rotation
-    timer = threading.Timer(
-        LOADING_INDICATOR_ROTATION_INTERVAL,
-        rotate_loading_indicator,
-        args=(live, text_obj, status_words, first_activity)
-    )
-    timer.daemon = True
-    timer.start()
-
-
-def display_streaming_response(console: Console, agent, user_input: str) -> str:
-    """Display streaming response with Claude-style loading indicator.
-
-    Args:
-        console: Rich console instance
-        agent: Agent instance
-        user_input: User's input message
-
-    Returns:
-        The complete response text
-    """
-    loading_text, status_words = create_loading_indicator()
-    first_activity = [False]
-    rotation_timer = None
-    events: List[Tuple[str, str]] = []
-    response_chunks: List[str] = []
-    live_ref: List[Optional[Live]] = [None]
-
-    def handle_tool_call(tool_name: str, args: dict) -> None:
-        """Record tool calls in the live markdown preview."""
-        first_activity[0] = True
-        events.append(("tool", _format_tool_call_line(tool_name, args)))
+    def refresh_live() -> None:
         if live_ref[0] is not None:
-            live_ref[0].update(
-                _build_stream_renderable(events, loading_text),
-                refresh=True,
-            )
+            live_ref[0].update(display.render_live(), refresh=True)
 
-    stream = agent.run_stream(
-        user_input,
-        on_tool_call=handle_tool_call
-    )
+    def handle_event(event) -> None:
+        display.handle_event(event)
+        refresh_live()
 
     try:
         with Live(
-            _build_stream_renderable(events, loading_text),
+            display.render_live(),
             console=console,
-            refresh_per_second=10,
-            transient=True,
-            auto_refresh=False,
+            transient=False,
+            auto_refresh=animate_live,
+            refresh_per_second=12 if animate_live else 4,
         ) as live:
             live_ref[0] = live
-            rotation_timer = threading.Timer(
-                LOADING_INDICATOR_ROTATION_INTERVAL,
-                rotate_loading_indicator,
-                args=(live, loading_text, status_words, first_activity)
-            )
-            rotation_timer.daemon = True
-            rotation_timer.start()
-
-            for token in stream:
-                first_activity[0] = True
-                response_chunks.append(token)
-                _append_assistant_chunk(events, token)
-                live.update(
-                    _build_stream_renderable(events, loading_text),
-                    refresh=True,
-                )
+            if enable_streaming:
+                for token in agent.run_stream(user_input, on_event=handle_event):
+                    display.append_stream_chunk(token)
+                    refresh_live()
+                response = _final_response_from_context(agent, display.final_response_text())
+            else:
+                response = agent.run(user_input, on_event=handle_event)
+            live.update(display.render_persisted(), refresh=True)
     finally:
         live_ref[0] = None
-        if rotation_timer and rotation_timer.is_alive():
-            rotation_timer.cancel()
 
-    if events:
-        console.print(_build_stream_renderable(events))
+    if response:
+        console.print()
+        console.print(Markdown(response))
 
-    return "".join(response_chunks)
+    return response
+
+
+def display_streaming_response(console: Console, agent, user_input: str) -> str:
+    """Backward-compatible streaming helper."""
+    return run_agent_turn(
+        console,
+        agent,
+        user_input,
+        enable_streaming=True,
+        skill_debug=False,
+    )
 
 
 def main() -> None:
@@ -245,10 +148,14 @@ def main() -> None:
     # Load configuration
     enable_streaming = config.ui.enable_streaming
     provider = config.llm.provider
+    skill_debug = os.environ.get("SKILL_DEBUG", "").lower() in DEBUG_ENABLED_VALUES
 
     # Use stderr for Rich output to avoid conflicts with prompt_toolkit using stdout
     import sys
     console = Console(stderr=True)
+
+    if skill_debug:
+        console.print("[dim][SKILL] Debug mode enabled[/dim]")
 
     # Check for API key (from config or environment variable)
     # Only check if provider requires it (ollama/local don't)
@@ -273,6 +180,17 @@ def main() -> None:
 
     for warning in skill_warnings:
         console.print(f"[yellow]Skill warning: {warning}[/yellow]")
+
+    if skill_debug:
+        discovered_skills = skill_manager.list_skills()
+        console.print(f"[dim][SKILL] discovered {len(discovered_skills)} skill(s)[/dim]")
+        for skill in discovered_skills:
+            console.print(
+                "[dim]"
+                f"[SKILL] discovered {skill.name} "
+                f"(source={skill.source}, catalog={'yes' if skill.catalog_visible else 'no'})"
+                "[/dim]"
+            )
 
     try:
         llm_client = LLMClient()
@@ -359,8 +277,10 @@ def main() -> None:
     # Initialize input helper for bash-like editing with command completion
     input_helper = InputHelper(
         command_names=command_names,
-        command_descriptions=command_descriptions
+        command_descriptions=command_descriptions,
+        skill_names=[skill.name for skill in skill_manager.list_skills()],
     )
+    cmd_context["input_helper"] = input_helper
 
     # Print banner
     print_banner(console)
@@ -391,22 +311,22 @@ def main() -> None:
                 console.print("\n[bold cyan]Agent[/bold cyan] >")
 
                 if enable_streaming:
-                    # Stream response token-by-token
-                    response = display_streaming_response(console, agent, user_input)
-                    # Display metrics after response (Live display already showed response)
+                    response = run_agent_turn(
+                        console,
+                        agent,
+                        user_input,
+                        enable_streaming=True,
+                        skill_debug=skill_debug,
+                    )
                     display_metrics(console, agent.request_metrics, REQUEST_TYPE_STREAMING)
                 else:
-                    # Show loading indicator while agent processes
-                    with console.status("[dim]Thinking...[/dim]", spinner="dots"):
-                        response = agent.run(
-                            user_input,
-                            on_tool_call=lambda name, args: on_tool_call(console, name, args)
-                        )
-
-                    # Display response
-                    console.print("\n")
-                    console.print(Markdown(response))
-                    # Display metrics after response
+                    response = run_agent_turn(
+                        console,
+                        agent,
+                        user_input,
+                        enable_streaming=False,
+                        skill_debug=skill_debug,
+                    )
                     display_metrics(console, agent.request_metrics, REQUEST_TYPE_NON_STREAMING)
 
             except KeyboardInterrupt:

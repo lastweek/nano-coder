@@ -1,83 +1,78 @@
 """Test logging integration between Agent and LLMClient."""
 
-import pytest
-import tempfile
+import json
 from pathlib import Path
+from unittest.mock import Mock, patch
+
 from src.agent import Agent
-from src.llm import LLMClient
+from src.config import config
 from src.context import Context
+from src.llm import LLMClient
 from src.tools import ToolRegistry
 from tools.read import ReadTool
-from unittest.mock import Mock, patch
 
 
 class TestLoggingIntegration:
     """Test that logging is properly integrated across components."""
 
-    def test_agent_shares_logger_with_llm_client(self, temp_dir):
-        """Test that Agent injects its logger into LLMClient."""
-        # Create components
+    def test_agent_shares_logger_with_llm_client(self, temp_dir, monkeypatch):
+        """Agent should inject its logger into LLMClient."""
+        monkeypatch.setattr(config.logging, "log_dir", str(temp_dir))
         context = Context.create(cwd=str(temp_dir))
         tools = ToolRegistry()
         tools.register(ReadTool())
-
-        # Create LLMClient without logger (use ollama to avoid API key requirement)
         llm_client = LLMClient(provider="ollama")
-
-        # Create Agent (should share its logger with LLMClient)
         agent = Agent(llm_client, tools, context)
 
-        # Verify logger is shared
         assert llm_client.logger is not None
         assert llm_client.logger is agent.logger
         assert llm_client.logger.session_id == context.session_id
 
-    def test_llm_client_logs_requests_and_responses(self, temp_dir):
-        """Test that LLMClient actually logs when called through Agent."""
-        # Create components
+    def test_agent_run_creates_session_directory_with_llm_and_events(self, temp_dir, monkeypatch):
+        """A normal agent run should create session.json, llm.log, and events.jsonl."""
+        monkeypatch.setattr(config.logging, "log_dir", str(temp_dir))
         context = Context.create(cwd=str(temp_dir))
         tools = ToolRegistry()
         tools.register(ReadTool())
-
-        # Create LLMClient (use ollama to avoid API key requirement)
         llm_client = LLMClient(provider="ollama")
-
-        # Create Agent with logger
         agent = Agent(llm_client, tools, context)
 
-        # Get the session_id to find the specific log file
-        session_id = context.session_id[:8]  # First 8 chars as used in filename
-
-        # Mock the chat.completions.create to avoid real API call
         mock_response = Mock()
+        mock_response.usage = None
         mock_response.choices = [Mock()]
         mock_response.choices[0].message.role = "assistant"
         mock_response.choices[0].message.content = "Hello!"
         mock_response.choices[0].message.tool_calls = None
 
-        with patch.object(llm_client.client.chat.completions, 'create', return_value=mock_response):
-            # Call chat through LLMClient
-            result = llm_client.chat([{"role": "user", "content": "test"}])
+        with patch.object(llm_client.client.chat.completions, "create", return_value=mock_response):
+            response = agent.run("test")
 
-            # Close logger to flush buffered entries
-            agent.logger.close()
+        assert response == "Hello!"
+        agent.logger.close()
 
-            # Get the log directory from the logger
-            log_dir = agent.logger.log_dir
+        session_dir = agent.logger.session_dir
+        assert session_dir is not None
+        session = json.loads((session_dir / "session.json").read_text())
+        assert session["turn_count"] == 1
+        assert session["llm_call_count"] == 1
+        assert session["timeline_format_version"] == 2
+        assert session["primary_debug_log"] == "llm.log"
 
-            # Find the specific log file for this session
-            log_files = list(log_dir.glob(f"session-{session_id}-*.jsonl"))
-            assert len(log_files) == 1, f"Expected 1 log file for session {session_id}, found {len(log_files)}"
+        llm_log = (session_dir / "llm.log").read_text()
+        assert "TURN START" in llm_log
+        assert "LLM REQUEST" in llm_log
+        assert "REQUEST JSON" in llm_log
+        assert "\"messages\"" in llm_log
+        assert "LLM RESPONSE" in llm_log
+        assert "RESPONSE JSON" in llm_log
+        assert "TURN END" in llm_log
+        assert "\"content\": \"Hello!\"" in llm_log
 
-            # Check log contains llm_request and llm_response
-            content = log_files[0].read_text()
-            assert '"type": "llm_request"' in content
-            assert '"type": "llm_response"' in content
-
-            # Clean up
-            log_files[0].unlink()
-            latest_link = log_dir / "latest.jsonl"
-            if latest_link.exists():
-                latest_link.unlink()
-            if log_dir.exists() and not list(log_dir.iterdir()):
-                log_dir.rmdir()
+        events = [
+            json.loads(line)
+            for line in (session_dir / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        kinds = [event["kind"] for event in events]
+        assert "turn_started" in kinds
+        assert "turn_completed" in kinds

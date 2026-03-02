@@ -1,5 +1,6 @@
 """Tests for the skills runtime."""
 
+import json
 from pathlib import Path
 
 from src.context import Context
@@ -33,6 +34,7 @@ def test_valid_skill_parses_correctly(temp_dir):
     assert skill.description == "Handle PDFs"
     assert skill.short_description == "PDF workflows"
     assert skill.body == "Prefer visual PDF checks."
+    assert skill.catalog_visible is True
 
 
 def test_invalid_frontmatter_is_skipped(temp_dir):
@@ -105,7 +107,26 @@ def test_repo_skill_overrides_user_skill(temp_dir):
     assert skill.source == "repo"
     assert skill.skill_file == repo_skill.resolve()
     assert skill.body == "Repo body"
+    assert skill.catalog_visible is True
     assert any("Duplicate skill 'shared'" in warning for warning in warnings)
+
+
+def test_user_global_skills_are_catalog_visible(temp_dir):
+    """User-global skills should be included in the catalog."""
+    user_root = temp_dir / "user-skills"
+    write_skill(
+        user_root / "terraform",
+        "name: terraform\ndescription: Handle Terraform\nmetadata:\n  short-description: Terraform workflows",
+        "Use terraform plan first.",
+    )
+
+    manager = SkillManager(repo_root=temp_dir / "repo", user_root=user_root)
+    manager.discover()
+
+    skill = manager.get_skill("terraform")
+    assert skill is not None
+    assert skill.catalog_visible is True
+    assert [catalog_skill.name for catalog_skill in manager.list_catalog_skills()] == ["terraform"]
 
 
 def test_load_skill_tool_returns_formatted_payload(temp_dir):
@@ -141,3 +162,62 @@ def test_load_skill_tool_returns_error_for_unknown_skill(temp_dir):
 
     assert result.success is False
     assert result.error == "Unknown skill: missing"
+
+
+def test_list_catalog_skills_returns_repo_and_user_visible_skills(temp_dir):
+    """The catalog should contain both repo-local and user-global skills."""
+    repo_root = temp_dir / "repo"
+    user_root = temp_dir / "user-skills"
+    write_skill(repo_root / ".nano-coder" / "skills" / "pdf", "name: pdf\ndescription: Handle PDFs")
+    write_skill(user_root / "terraform", "name: terraform\ndescription: Handle Terraform")
+
+    manager = SkillManager(repo_root=repo_root, user_root=user_root)
+    manager.discover()
+
+    assert [skill.name for skill in manager.list_catalog_skills()] == ["pdf", "terraform"]
+
+
+def test_extract_skill_mentions_parses_known_names_and_ignores_unknown(temp_dir):
+    """Known $skill mentions should be extracted and deduplicated in order."""
+    repo_root = temp_dir / "repo"
+    write_skill(repo_root / ".nano-coder" / "skills" / "pdf", "name: pdf\ndescription: Handle PDFs")
+    write_skill(repo_root / ".nano-coder" / "skills" / "terraform", "name: terraform\ndescription: Handle Terraform")
+
+    manager = SkillManager(repo_root=repo_root, user_root=temp_dir / "user-skills")
+    manager.discover()
+
+    result = manager.extract_skill_mentions("$pdf summarize with $terraform and $pdf but leave $HOME")
+
+    assert result.skill_names == ["pdf", "terraform"]
+    assert result.cleaned_text == "summarize with and but leave $HOME"
+
+
+def test_build_preload_messages_returns_assistant_tool_pairs(temp_dir):
+    """Synthetic preload messages should match assistant/tool transcript structure."""
+    repo_root = temp_dir / "repo"
+    write_skill(
+        repo_root / ".nano-coder" / "skills" / "pdf",
+        "name: pdf\ndescription: Handle PDFs",
+        "Prefer visual checks.",
+    )
+    write_skill(
+        repo_root / ".nano-coder" / "skills" / "terraform",
+        "name: terraform\ndescription: Handle Terraform",
+        "Run plan first.",
+    )
+
+    manager = SkillManager(repo_root=repo_root, user_root=temp_dir / "user-skills")
+    manager.discover()
+
+    messages = manager.build_preload_messages(["pdf", "terraform"])
+
+    assert len(messages) == 4
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["tool_calls"][0]["function"]["name"] == "load_skill"
+    assert json.loads(messages[0]["tool_calls"][0]["function"]["arguments"]) == {"skill_name": "pdf"}
+    assert messages[1]["role"] == "tool"
+    assert "Skill: pdf" in messages[1]["content"]
+    assert messages[2]["tool_calls"][0]["function"]["name"] == "load_skill"
+    assert json.loads(messages[2]["tool_calls"][0]["function"]["arguments"]) == {"skill_name": "terraform"}
+    assert messages[3]["role"] == "tool"
+    assert "Skill: terraform" in messages[3]["content"]

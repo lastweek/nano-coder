@@ -34,6 +34,12 @@ def create_skill_context(temp_dir):
     """Create a command registry and skill command context."""
     repo_root = temp_dir / "repo"
     write_skill(repo_root / ".nano-coder" / "skills" / "pdf")
+    write_skill(
+        temp_dir / "user-skills" / "terraform",
+        name="terraform",
+        description="Handle Terraform",
+        short_description="Terraform workflows",
+    )
     manager = SkillManager(repo_root=repo_root, user_root=temp_dir / "user-skills")
     manager.discover()
 
@@ -60,8 +66,11 @@ def test_skill_command_lists_available_skills(temp_dir):
     text = output.getvalue()
     assert "Available Skills" in text
     assert "pdf" in text
+    assert "terraform" in text
     assert "PDF workflows" in text
-    assert "no" in text
+    assert "Terraform workflows" in text
+    assert "Catalog" in text
+    assert text.count("yes") >= 2
 
 
 def test_skill_use_and_clear_commands_update_pins(temp_dir):
@@ -112,8 +121,23 @@ def test_skill_show_displays_metadata_and_resources(temp_dir):
     text = output.getvalue()
     assert "Skill: pdf" in text
     assert "Description:" in text
+    assert "Catalog Visible:" in text
     assert "Skill File:" in text
     assert str(ref_file.resolve()) in text
+
+
+def test_skill_show_reports_user_global_skill_as_catalog_visible(temp_dir):
+    """User-global skills should report catalog visibility in `/skill show`."""
+    registry, _, _, command_context = create_skill_context(temp_dir)
+    output = io.StringIO()
+    console = create_console(output)
+
+    registry.execute("/skill show terraform", console, command_context)
+
+    text = output.getvalue()
+    assert "Skill: terraform" in text
+    assert "Catalog Visible:" in text
+    assert "yes" in text
 
 
 def test_skill_reload_prunes_missing_pins(temp_dir):
@@ -131,7 +155,7 @@ def test_skill_reload_prunes_missing_pins(temp_dir):
     assert session_context.get_active_skills() == []
     text = output.getvalue()
     assert "Removed missing pinned skill: pdf" in text
-    assert "Reloaded 0 skill(s)" in text
+    assert "Reloaded 1 skill(s)" in text
 
 
 def test_skill_command_reports_unknown_skill(temp_dir):

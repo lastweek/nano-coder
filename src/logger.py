@@ -1,35 +1,56 @@
-"""Chat completion logging for Nano-Coder."""
+"""Session logging for Nano-Coder."""
+
+from __future__ import annotations
 
 import json
+import os
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from queue import Empty, Queue
 from threading import Lock, Thread
-from queue import Queue
+from typing import Any, Callable, Dict, List, Optional
+
 from src.config import config
 
 
-class ChatLogger:
-    """Logs chat completions and tool executions to JSONL files."""
+SESSION_HEADER_RULE = "=" * 80
+SECTION_RULE = "-" * 80
+ARTIFACT_SPILL_THRESHOLD = 8192
 
-    def __init__(self, session_id: str, log_dir: Optional[str] = None, enabled: Optional[bool] = None, buffer_size: Optional[int] = None, async_mode: Optional[bool] = None):
-        """Initialize the logger.
 
-        Args:
-            session_id: Unique session identifier
-            log_dir: Directory to store log files (defaults to config.logging.log_dir)
-            enabled: Whether logging is enabled (defaults to config.logging.enabled)
-            buffer_size: Number of log entries to buffer before flushing (defaults to config.logging.buffer_size)
-            async_mode: If True, use background thread for non-blocking logging (defaults to config.logging.async_mode)
-        """
+@dataclass
+class _TurnState:
+    """In-memory tracking for a single turn."""
+
+    turn_id: int
+    started_at: str
+    raw_user_input: str
+    normalized_user_input: str
+    llm_call_count: int = 0
+    tool_call_count: int = 0
+    tools_used: List[str] = field(default_factory=list)
+    skills_used: List[str] = field(default_factory=list)
+    status: str = "open"
+
+
+class SessionLogger:
+    """Write per-session logs to a session directory."""
+
+    def __init__(
+        self,
+        session_id: str,
+        log_dir: Optional[str] = None,
+        enabled: Optional[bool] = None,
+        buffer_size: Optional[int] = None,
+        async_mode: Optional[bool] = None,
+    ):
+        """Initialize the logger."""
         self.session_id = session_id
 
-        # Use config defaults if not specified
         if log_dir is None:
             log_dir = config.logging.log_dir
         if enabled is None:
-            # Check env var directly for backward compatibility
-            import os
             env_value = os.environ.get("ENABLE_LOGGING", "").lower()
             if env_value == "false":
                 enabled = False
@@ -45,184 +66,809 @@ class ChatLogger:
         self.log_dir = Path(log_dir)
         self.enabled = enabled
         self.async_mode = async_mode
+        self.buffer_size = buffer_size
 
         self._lock = Lock()
-        self._file = None
-        self._buffer = []
-        self._buffer_size = buffer_size
+        self._timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self._session_dir_name = f"session-{self._timestamp}-{self.session_id[:8]}"
+        self.session_dir: Optional[Path] = None
+        self._artifacts_dir: Optional[Path] = None
+        self._session_json_path: Optional[Path] = None
+        self._llm_log_path: Optional[Path] = None
+        self._events_path: Optional[Path] = None
+        self._initialized = False
+        self._closed = False
 
-        # Async mode: queue and writer thread
-        self._queue = None
-        self._writer_thread = None
+        self._session_started_at = datetime.now().isoformat()
+        self._session_ended_at: Optional[str] = None
+        self._session_status = "open"
+        self._session_metadata: Dict[str, Any] = {
+            "cwd": None,
+            "provider": None,
+            "model": None,
+            "base_url": None,
+            "streaming_enabled": None,
+        }
+        self._turn_counter = 0
+        self._event_seq = 0
+        self._timeline_seq = 0
+        self._llm_call_count = 0
+        self._tool_call_count = 0
+        self._skill_event_count = 0
+        self._error_count = 0
+        self._turns: Dict[int, _TurnState] = {}
+        self._session_footer_written = False
+
+        self._queue: Optional[Queue] = None
+        self._writer_thread: Optional[Thread] = None
         self._stop_requested = False
-
         if self.enabled and self.async_mode:
             self._queue = Queue()
             self._start_writer_thread()
 
-    def _open_log_file(self):
-        """Open/create the log file for this session."""
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+    def start_session(
+        self,
+        *,
+        cwd: str,
+        provider: str,
+        model: str,
+        base_url: Optional[str],
+        streaming_enabled: bool,
+    ) -> None:
+        """Store session metadata for later manifest creation."""
+        if not self.enabled:
+            return
 
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_path = self.log_dir / f"session-{self.session_id[:8]}-{timestamp}.jsonl"
+        self._session_metadata.update(
+            {
+                "cwd": str(cwd) if cwd is not None else None,
+                "provider": str(provider) if provider is not None else None,
+                "model": str(model) if model is not None else None,
+                "base_url": str(base_url) if base_url is not None else None,
+                "streaming_enabled": streaming_enabled,
+            }
+        )
 
-        self._file = open(log_path, "a", encoding="utf-8")
+    def start_turn(self, *, raw_user_input: str, normalized_user_input: str) -> int:
+        """Start a new turn and return its id."""
+        if not self.enabled:
+            self._turn_counter += 1
+            return self._turn_counter
 
-        # Create/update symlink to latest
-        latest_link = self.log_dir / "latest.jsonl"
-        if latest_link.exists():
-            latest_link.unlink()
-        try:
-            latest_link.symlink_to(log_path.name)
-        except OSError:
-            # Symlinks may not work on all systems, skip if fails
-            pass
+        self._turn_counter += 1
+        turn_id = self._turn_counter
+        turn_state = _TurnState(
+            turn_id=turn_id,
+            started_at=datetime.now().isoformat(),
+            raw_user_input=raw_user_input,
+            normalized_user_input=normalized_user_input,
+        )
+        self._turns[turn_id] = turn_state
 
-    def _ensure_file_open(self) -> None:
-        """Open log file on first write (lazy initialization)."""
-        if self.enabled and self._file is None:
-            self._open_log_file()
+        self._submit_write(self._record_turn_started, turn_state)
+        self._submit_write(self._write_session_manifest)
+        return turn_id
 
-    def _start_writer_thread(self):
-        """Start background thread for async logging."""
-        def writer():
-            while not self._stop_requested:
+    def log_llm_request(
+        self,
+        turn_id: int,
+        iteration: int,
+        request_payload: Dict[str, Any],
+        provider: str,
+        model: str,
+        stream: bool,
+    ) -> None:
+        """Log an LLM request block to llm.log."""
+        if not self.enabled:
+            return
+
+        turn_state = self._turns.get(turn_id)
+        if turn_state is not None:
+            turn_state.llm_call_count += 1
+        self._llm_call_count += 1
+
+        self._submit_write(
+            self._record_llm_request,
+            turn_id,
+            iteration,
+            request_payload,
+            provider,
+            model,
+            stream,
+        )
+        self._submit_write(self._write_session_manifest)
+
+    def log_llm_response(
+        self,
+        turn_id: int,
+        iteration: int,
+        response_payload: Dict[str, Any],
+        provider: str,
+        model: str,
+        stream: bool,
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log an LLM response block to llm.log."""
+        if not self.enabled:
+            return
+
+        self._submit_write(
+            self._record_llm_response,
+            turn_id,
+            iteration,
+            response_payload,
+            provider,
+            model,
+            stream,
+            metrics or {},
+        )
+
+    def log_skill_event(self, turn_id: int, event: str, **details: Any) -> None:
+        """Log a skill event to events.jsonl and llm.log."""
+        if not self.enabled:
+            return
+
+        self._skill_event_count += 1
+        turn_state = self._turns.get(turn_id)
+        skill_name = details.get("skill_name")
+        if turn_state is not None and skill_name and skill_name not in turn_state.skills_used:
+            turn_state.skills_used.append(skill_name)
+
+        self._submit_write(self._record_skill_event, turn_id, event, details)
+        self._submit_write(self._write_session_manifest)
+
+    def log_tool_call(
+        self,
+        turn_id: int,
+        iteration: int,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        tool_call_id: Optional[str] = None,
+    ) -> None:
+        """Log a tool call to both outputs."""
+        if not self.enabled:
+            return
+
+        self._tool_call_count += 1
+        turn_state = self._turns.get(turn_id)
+        if turn_state is not None:
+            turn_state.tool_call_count += 1
+            if tool_name not in turn_state.tools_used:
+                turn_state.tools_used.append(tool_name)
+
+        self._submit_write(
+            self._record_tool_call,
+            turn_id,
+            iteration,
+            tool_name,
+            tool_call_id,
+            arguments,
+        )
+        self._submit_write(self._write_session_manifest)
+
+    def log_tool_result(
+        self,
+        turn_id: int,
+        iteration: int,
+        tool_name: str,
+        result: Dict[str, Any],
+        tool_call_id: Optional[str] = None,
+    ) -> None:
+        """Log a tool result to both outputs."""
+        if not self.enabled:
+            return
+
+        self._submit_write(
+            self._record_tool_result,
+            turn_id,
+            iteration,
+            tool_name,
+            tool_call_id,
+            result,
+        )
+
+    def finish_turn(
+        self,
+        turn_id: int,
+        final_response: str,
+        request_metrics: List[Any],
+        status: str = "completed",
+        error: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Finalize a turn and update the session manifest."""
+        if not self.enabled:
+            return
+
+        turn_state = self._turns.get(turn_id)
+        if turn_state is None or turn_state.status != "open":
+            return
+
+        turn_state.status = status
+        self._submit_write(
+            self._record_turn_completed,
+            turn_state,
+            final_response,
+            self._summarize_metrics(request_metrics),
+            error,
+        )
+        self._submit_write(self._write_session_manifest)
+
+    def log_error(
+        self,
+        *,
+        turn_id: Optional[int],
+        phase: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log a structured error event."""
+        if not self.enabled:
+            return
+
+        self._error_count += 1
+        self._submit_write(
+            self._record_error,
+            turn_id,
+            phase,
+            message,
+            details or {},
+        )
+        self._submit_write(self._write_session_manifest)
+
+    def close(self, status: str = "completed") -> None:
+        """Close the logger and flush all pending writes."""
+        if not self.enabled or self._closed:
+            return
+
+        self._closed = True
+        self._session_ended_at = datetime.now().isoformat()
+        self._session_status = status
+
+        if self._initialized:
+            self._submit_write(self._record_session_completed)
+            self._submit_write(self._write_session_manifest)
+
+        if self.async_mode and self._queue is not None and self._writer_thread is not None:
+            self._stop_requested = True
+            self._queue.put(None)
+            self._writer_thread.join(timeout=5.0)
+            self._writer_thread = None
+
+    def __enter__(self) -> "SessionLogger":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close(status="error" if exc_type is not None else "completed")
+
+    def _start_writer_thread(self) -> None:
+        """Start the async writer thread."""
+
+        def writer() -> None:
+            while True:
                 try:
-                    # Get entry with timeout to allow checking stop_requested
-                    entry = self._queue.get(timeout=0.1)
-                    if entry is None:  # Poison pill
-                        break
-                    self._ensure_file_open()
-                    self._write_entry(entry)
-                except (Queue.Empty, TimeoutError):
-                    continue  # Timeout or empty queue, continue loop
-                except Exception as e:
-                    # Log unexpected errors but continue running
-                    import logging
-                    logging.warning(f"Writer thread error: {e}")
+                    item = self._queue.get(timeout=0.1)
+                except Empty:
+                    continue
+
+                if item is None:
+                    break
+
+                try:
+                    func, args, kwargs = item
+                    func(*args, **kwargs)
+                except Exception:
+                    self._write_fallback_error("logger.async_writer", "Writer thread error")
 
         self._writer_thread = Thread(target=writer, daemon=True)
         self._writer_thread.start()
 
-    def _write_entry(self, entry: Dict[str, Any]) -> None:
-        """Write a single log entry (called by sync or async mode)."""
+    def _submit_write(self, func: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+        """Submit a write operation in-order."""
         if not self.enabled:
             return
 
-        self._ensure_file_open()
+        func(*args, **kwargs)
 
-        if self._file is None:
+    def _ensure_initialized(self) -> None:
+        """Create the session directory and base files on first write."""
+        if self._initialized:
             return
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.session_dir = self.log_dir / self._session_dir_name
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self._artifacts_dir = self.session_dir / "artifacts"
+        self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self._session_json_path = self.session_dir / "session.json"
+        self._llm_log_path = self.session_dir / "llm.log"
+        self._events_path = self.session_dir / "events.jsonl"
+
+        self._update_symlink(self.log_dir / "latest-session", self.session_dir)
+        self._update_symlink(self.log_dir / "latest.log", self._llm_log_path)
+
+        self._initialized = True
+        self._write_session_manifest()
+        self._record_session_started()
+
+    def _update_symlink(self, link_path: Path, target: Path) -> None:
+        """Create or refresh a symlink when supported."""
+        try:
+            if link_path.exists() or link_path.is_symlink():
+                link_path.unlink()
+            relative_target = target.relative_to(self.log_dir)
+            link_path.symlink_to(relative_target)
+        except OSError:
+            pass
+
+    def _write_session_manifest(self) -> None:
+        """Write session.json."""
+        self._ensure_initialized()
+        assert self._session_json_path is not None
+
+        payload = {
+            "schema_version": 1,
+            "timeline_format_version": 2,
+            "primary_debug_log": "llm.log",
+            "session_id": self.session_id,
+            "started_at": self._session_started_at,
+            "ended_at": self._session_ended_at,
+            "status": self._session_status,
+            "cwd": self._session_metadata["cwd"],
+            "provider": self._session_metadata["provider"],
+            "model": self._session_metadata["model"],
+            "base_url": self._session_metadata["base_url"],
+            "streaming_enabled": self._session_metadata["streaming_enabled"],
+            "turn_count": len(self._turns),
+            "llm_call_count": self._llm_call_count,
+            "tool_call_count": self._tool_call_count,
+            "skill_event_count": self._skill_event_count,
+            "error_count": self._error_count,
+            "llm_log": "llm.log",
+            "events_log": "events.jsonl",
+            "artifacts_dir": "artifacts",
+        }
 
         with self._lock:
-            entry["timestamp"] = datetime.now().isoformat()
-            entry["session_id"] = self.session_id
-            self._buffer.append(json.dumps(entry))
+            self._session_json_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",
+                encoding="utf-8",
+            )
 
-            # Flush when buffer reaches threshold
-            if len(self._buffer) >= self._buffer_size:
-                self._flush_buffer()
+    def _next_timeline_seq(self) -> int:
+        """Return the next timeline step id."""
+        self._timeline_seq += 1
+        return self._timeline_seq
 
-    def log(self, entry: Dict[str, Any]) -> None:
-        """Write a log entry to the file.
+    def _append_llm_log(self, text: str) -> None:
+        """Append text to llm.log."""
+        self._ensure_initialized()
+        assert self._llm_log_path is not None
+        with self._lock:
+            with open(self._llm_log_path, "a", encoding="utf-8") as handle:
+                handle.write(text)
 
-        Args:
-            entry: Dictionary containing log data
-        """
-        if not self.enabled:
+    def _append_event(self, kind: str, timeline_seq: Optional[int], **fields: Any) -> None:
+        """Append a structured event to events.jsonl."""
+        self._ensure_initialized()
+        assert self._events_path is not None
+
+        self._event_seq += 1
+        entry = {
+            "seq": self._event_seq,
+            "timeline_seq": timeline_seq,
+            "timestamp": datetime.now().isoformat(),
+            "session_id": self.session_id,
+            "kind": kind,
+            **fields,
+        }
+
+        with self._lock:
+            with open(self._events_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+    def _append_json_block(self, label: str, payload: Any) -> List[str]:
+        """Render a JSON block for llm.log."""
+        return [label, "<<<json", self._pretty_json(payload), ">>>", ""]
+
+    def _append_text_block(self, label: str, text: str) -> List[str]:
+        """Render a text block for llm.log."""
+        return [label, "<<<", text or "", ">>>", ""]
+
+    def _write_timeline_block(
+        self,
+        *,
+        rule: str,
+        header: str,
+        timestamp: str,
+        metadata_lines: Optional[List[str]] = None,
+        sections: Optional[List[str]] = None,
+    ) -> None:
+        """Write a fully formatted timeline block to llm.log."""
+        lines = [rule, header, f"Timestamp: {timestamp}"]
+        if metadata_lines:
+            lines.extend(metadata_lines)
+        lines.extend([rule, ""])
+        if sections:
+            lines.extend(sections)
+        self._append_llm_log("".join(f"{line}\n" for line in lines))
+
+    def _record_session_started(self) -> None:
+        """Write the session start block and event."""
+        if self._session_footer_written:
             return
 
-        self._ensure_file_open()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        self._append_event(
+            "session_started",
+            timeline_seq,
+            cwd=self._session_metadata["cwd"],
+            provider=self._session_metadata["provider"],
+            model=self._session_metadata["model"],
+            base_url=self._session_metadata["base_url"],
+            streaming_enabled=self._session_metadata["streaming_enabled"],
+        )
+        self._write_timeline_block(
+            rule=SESSION_HEADER_RULE,
+            header=f"STEP {timeline_seq:04d} | SESSION START",
+            timestamp=timestamp,
+            metadata_lines=[
+                f"Session ID: {self.session_id}",
+                f"CWD: {self._session_metadata['cwd']}",
+                f"Provider: {self._session_metadata['provider']}",
+                f"Model: {self._session_metadata['model']}",
+                f"Base URL: {self._session_metadata['base_url']}",
+                f"Streaming: {str(bool(self._session_metadata['streaming_enabled'])).lower()}",
+            ],
+        )
 
-        if self.async_mode:
-            # Non-blocking: queue for background thread
-            self._queue.put(entry)
-        else:
-            # Blocking: write immediately
-            self._write_entry(entry)
+    def _record_session_completed(self) -> None:
+        """Write the session end block and event."""
+        if self._session_footer_written:
+            return
 
-    def _flush_buffer(self) -> None:
-        """Flush the buffer to file."""
-        if self._buffer and self._file:
-            self._file.write("\n".join(self._buffer) + "\n")
-            self._file.flush()
-            self._buffer.clear()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        self._append_event(
+            "session_completed",
+            timeline_seq,
+            status=self._session_status,
+            ended_at=self._session_ended_at,
+        )
+        self._write_timeline_block(
+            rule=SESSION_HEADER_RULE,
+            header=f"STEP {timeline_seq:04d} | SESSION END",
+            timestamp=timestamp,
+            metadata_lines=[
+                f"Status: {self._session_status}",
+                f"Turns: {len(self._turns)}",
+                f"LLM Calls: {self._llm_call_count}",
+                f"Tool Calls: {self._tool_call_count}",
+                f"Errors: {self._error_count}",
+            ],
+        )
+        self._session_footer_written = True
 
-    def log_llm_request(self, messages: List[Dict], tools: Optional[List[Dict]], model: str, provider: str) -> None:
-        """Log an LLM request."""
-        entry = {
-            "type": "llm_request",
-            "model": model,
-            "provider": provider,
-            "messages": messages,
+    def _record_turn_started(self, turn_state: _TurnState) -> None:
+        """Write turn start to both logs."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        self._append_event(
+            "turn_started",
+            timeline_seq,
+            turn_id=turn_state.turn_id,
+            raw_user_input=turn_state.raw_user_input,
+            normalized_user_input=turn_state.normalized_user_input,
+        )
+        sections = []
+        sections.extend(self._append_text_block("RAW USER INPUT", turn_state.raw_user_input))
+        sections.extend(self._append_text_block("NORMALIZED USER INPUT", turn_state.normalized_user_input))
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=f"STEP {timeline_seq:04d} | TURN {turn_state.turn_id:04d} | TURN START",
+            timestamp=timestamp,
+            sections=sections,
+        )
+
+    def _record_llm_request(
+        self,
+        turn_id: int,
+        iteration: int,
+        request_payload: Dict[str, Any],
+        provider: str,
+        model: str,
+        stream: bool,
+    ) -> None:
+        """Write an LLM request block."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        sections = self._append_json_block("REQUEST JSON", request_payload)
+        self._write_timeline_block(
+            rule=SESSION_HEADER_RULE,
+            header=(
+                f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | "
+                f"LLM REQUEST | STREAM={str(stream).lower()}"
+            ),
+            timestamp=timestamp,
+            metadata_lines=[f"Provider: {provider}", f"Model: {model}"],
+            sections=sections,
+        )
+
+    def _record_llm_response(
+        self,
+        turn_id: int,
+        iteration: int,
+        response_payload: Dict[str, Any],
+        provider: str,
+        model: str,
+        stream: bool,
+        metrics: Dict[str, Any],
+    ) -> None:
+        """Write an LLM response block."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        sections = self._append_json_block("RESPONSE JSON", response_payload)
+        if metrics:
+            sections.extend(self._append_json_block("METRICS", metrics))
+        self._write_timeline_block(
+            rule=SESSION_HEADER_RULE,
+            header=(
+                f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | "
+                f"LLM RESPONSE | STREAM={str(stream).lower()}"
+            ),
+            timestamp=timestamp,
+            metadata_lines=[f"Provider: {provider}", f"Model: {model}"],
+            sections=sections,
+        )
+
+    def _record_skill_event(self, turn_id: int, event: str, details: Dict[str, Any]) -> None:
+        """Write a skill event block and structured event."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        self._append_event(
+            "skill_event",
+            timeline_seq,
+            turn_id=turn_id,
+            event=event,
+            **details,
+        )
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | SKILL EVENT",
+            timestamp=timestamp,
+            metadata_lines=[f"Event: {event}"],
+            sections=self._append_json_block("DETAILS", details),
+        )
+
+    def _record_tool_call(
+        self,
+        turn_id: int,
+        iteration: int,
+        tool_name: str,
+        tool_call_id: Optional[str],
+        arguments: Dict[str, Any],
+    ) -> None:
+        """Write a tool call block and structured event."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        payload_fields = self._prepare_payload_fields(
+            payload=arguments,
+            turn_id=turn_id,
+            stem=f"turn-{turn_id:04d}-iteration-{iteration + 1:02d}-tool-call-{tool_name}-args",
+        )
+        self._append_event(
+            "tool_call",
+            timeline_seq,
+            turn_id=turn_id,
+            iteration=iteration,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            **payload_fields,
+        )
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | TOOL CALL",
+            timestamp=timestamp,
+            metadata_lines=[
+                f"Tool: {tool_name}",
+                f"Tool Call ID: {tool_call_id}",
+            ],
+            sections=self._append_json_block("ARGUMENTS JSON", arguments),
+        )
+
+    def _record_tool_result(
+        self,
+        turn_id: int,
+        iteration: int,
+        tool_name: str,
+        tool_call_id: Optional[str],
+        result: Dict[str, Any],
+    ) -> None:
+        """Write a tool result block and structured event."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        payload_fields = self._prepare_payload_fields(
+            payload=result,
+            turn_id=turn_id,
+            stem=f"turn-{turn_id:04d}-iteration-{iteration + 1:02d}-tool-result-{tool_name}",
+        )
+        status = "error" if "error" in result else "success"
+        self._append_event(
+            "tool_result",
+            timeline_seq,
+            turn_id=turn_id,
+            iteration=iteration,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            status=status,
+            **payload_fields,
+        )
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | TOOL RESULT",
+            timestamp=timestamp,
+            metadata_lines=[
+                f"Tool: {tool_name}",
+                f"Tool Call ID: {tool_call_id}",
+                f"Status: {status}",
+            ],
+            sections=self._append_json_block("RESULT JSON", result),
+        )
+
+    def _record_turn_completed(
+        self,
+        turn_state: _TurnState,
+        final_response: str,
+        metrics_summary: Dict[str, Any],
+        error: Optional[Dict[str, Any]],
+    ) -> None:
+        """Write turn completion to both logs."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        event_payload = {
+            "turn_id": turn_state.turn_id,
+            "status": turn_state.status,
+            "raw_user_input": turn_state.raw_user_input,
+            "normalized_user_input": turn_state.normalized_user_input,
+            "final_response_chars": len(final_response),
+            "llm_call_count": turn_state.llm_call_count,
+            "tool_call_count": turn_state.tool_call_count,
+            "tools_used": turn_state.tools_used,
+            "skills_used": turn_state.skills_used,
+            "metrics": metrics_summary,
         }
-        if tools:
-            entry["tools"] = tools
-        self.log(entry)
+        if error is not None:
+            event_payload["error"] = error
 
-    def log_llm_response(self, response: Dict) -> None:
-        """Log an LLM response."""
-        entry = {
-            "type": "llm_response",
-            **response
+        self._append_event("turn_completed", timeline_seq, **event_payload)
+
+        summary_payload = {
+            "status": turn_state.status,
+            "llm_call_count": turn_state.llm_call_count,
+            "tool_call_count": turn_state.tool_call_count,
+            "tools_used": turn_state.tools_used,
+            "skills_used": turn_state.skills_used,
+            "metrics": metrics_summary,
         }
-        self.log(entry)
+        if error is not None:
+            summary_payload["error"] = error
 
-    def log_tool_call(self, tool_name: str, arguments: Dict) -> None:
-        """Log a tool execution request."""
-        entry = {
-            "type": "tool_call",
-            "tool_name": tool_name,
-            "arguments": arguments
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=f"STEP {timeline_seq:04d} | TURN {turn_state.turn_id:04d} | TURN END",
+            timestamp=timestamp,
+            sections=self._append_json_block("SUMMARY JSON", summary_payload),
+        )
+
+    def _record_error(
+        self,
+        turn_id: Optional[int],
+        phase: str,
+        message: str,
+        details: Dict[str, Any],
+    ) -> None:
+        """Write an error block and structured event."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        self._append_event(
+            "error",
+            timeline_seq,
+            turn_id=turn_id,
+            phase=phase,
+            message=message,
+            details=details,
+        )
+        turn_label = f"TURN {turn_id:04d} | " if turn_id is not None else ""
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=f"STEP {timeline_seq:04d} | {turn_label}ERROR".strip(),
+            timestamp=timestamp,
+            metadata_lines=[f"Phase: {phase}"],
+            sections=self._append_json_block("DETAILS", {"message": message, "details": details}),
+        )
+
+    def _prepare_payload_fields(self, payload: Any, turn_id: int, stem: str) -> Dict[str, Any]:
+        """Inline or spill a payload depending on serialized size."""
+        serialized = self._serialize_payload(payload)
+        if len(serialized.encode("utf-8")) <= ARTIFACT_SPILL_THRESHOLD:
+            return {"payload": payload}
+
+        artifact_info = self._write_artifact(turn_id=turn_id, stem=stem, payload=payload)
+        return {
+            "payload_path": artifact_info["path"],
+            "payload_bytes": artifact_info["bytes"],
+            "payload_format": artifact_info["format"],
         }
-        self.log(entry)
 
-    def log_tool_result(self, tool_name: str, result: Dict) -> None:
-        """Log a tool execution result."""
-        entry = {
-            "type": "tool_result",
-            "tool_name": tool_name,
-            **result
+    def _write_artifact(self, turn_id: int, stem: str, payload: Any) -> Dict[str, Any]:
+        """Persist a large payload to artifacts/ and return its metadata."""
+        self._ensure_initialized()
+        assert self._artifacts_dir is not None
+
+        payload_format = "txt"
+        text = payload if isinstance(payload, str) else self._pretty_json(payload)
+        if not isinstance(payload, str):
+            payload_format = "json"
+
+        safe_stem = stem.replace("/", "-")
+        artifact_name = f"{safe_stem}.{payload_format}"
+        artifact_path = self._artifacts_dir / artifact_name
+        with self._lock:
+            artifact_path.write_text(text + ("" if text.endswith("\n") else "\n"), encoding="utf-8")
+
+        return {
+            "path": str(Path("artifacts") / artifact_name),
+            "bytes": len(text.encode("utf-8")),
+            "format": payload_format,
         }
-        self.log(entry)
 
-    def log_user_message(self, message: str) -> None:
-        """Log a user message."""
-        entry = {
-            "type": "user_message",
-            "content": message
+    def _serialize_payload(self, payload: Any) -> str:
+        """Serialize a payload for size checks."""
+        if isinstance(payload, str):
+            return payload
+        return self._pretty_json(payload)
+
+    def _pretty_json(self, payload: Any) -> str:
+        """Pretty-print JSON with stable formatting."""
+        return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+
+    def _summarize_metrics(self, request_metrics: List[Any]) -> Dict[str, Any]:
+        """Aggregate per-request metrics into a turn summary."""
+        summary = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
         }
-        self.log(entry)
+        for metrics in request_metrics:
+            summary["prompt_tokens"] += getattr(metrics, "prompt_tokens", 0)
+            summary["completion_tokens"] += getattr(metrics, "completion_tokens", 0)
+            summary["total_tokens"] += getattr(metrics, "total_tokens", 0)
+            summary["cached_tokens"] += getattr(metrics, "cached_tokens", 0)
+        return summary
 
-    def log_agent_response(self, response: str) -> None:
-        """Log the final agent response to the user."""
-        entry = {
-            "type": "agent_response",
-            "content": response
-        }
-        self.log(entry)
+    def _write_fallback_error(self, phase: str, message: str) -> None:
+        """Best-effort fallback error writing for logger internals."""
+        try:
+            self._ensure_initialized()
+            self._append_event(
+                "error",
+                self._next_timeline_seq(),
+                turn_id=None,
+                phase=phase,
+                message=message,
+                details={},
+            )
+        except Exception:
+            pass
 
-    def close(self) -> None:
-        """Close the log file and cleanup resources."""
-        # Stop writer thread if in async mode
-        if self.async_mode and self._writer_thread:
-            self._stop_requested = True
-            # Send poison pill to unblock the thread
-            self._queue.put(None)
-            # Wait for thread to finish (with timeout)
-            self._writer_thread.join(timeout=1.0)
-            self._writer_thread = None
 
-        if self._file:
-            with self._lock:
-                # Flush any remaining entries
-                self._flush_buffer()
-                self._file.close()
-                self._file = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+ChatLogger = SessionLogger

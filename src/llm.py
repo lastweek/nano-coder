@@ -1,12 +1,12 @@
 """LLM integration for Nano-Coder."""
 
 import os
-from typing import Optional, List, Dict, TYPE_CHECKING
+from typing import Optional, List, Dict, TYPE_CHECKING, Any
 from openai import OpenAI
 from src.config import config
 
 if TYPE_CHECKING:
-    from src.logger import ChatLogger
+    from src.logger import SessionLogger
     from src.metrics import LLMMetrics
 
 
@@ -19,7 +19,7 @@ class LLMClient:
         model: Optional[str] = None,
         base_url: Optional[str] = None,
         provider: Optional[str] = None,
-        logger: Optional['ChatLogger'] = None,
+        logger: Optional['SessionLogger'] = None,
     ):
         """Initialize the LLM client.
 
@@ -28,7 +28,7 @@ class LLMClient:
             model: Model name (defaults to MODEL env var or provider default)
             base_url: Custom base URL (defaults to BASE_URL env var)
             provider: Provider name for env var lookup (defaults to LLM_PROVIDER env var)
-            logger: Optional ChatLogger instance for logging requests/responses
+            logger: Optional SessionLogger instance for logging requests/responses
         """
         # Determine provider
         provider = provider or config.llm.provider
@@ -58,6 +58,7 @@ class LLMClient:
 
         self.model = model
         self.provider = provider
+        self.base_url = base_url
         self.logger = logger
 
         # Initialize OpenAI client (works with any OpenAI-compatible API)
@@ -128,6 +129,26 @@ class LLMClient:
         # This is not exact but provides a reasonable approximation
         return max(1, len(text) // 4)
 
+    def _apply_usage_metrics(self, metrics: 'LLMMetrics', usage: Any) -> bool:
+        """Apply usage metrics if the usage payload looks valid."""
+        if usage is None:
+            return False
+
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        if not all(isinstance(value, int) for value in (prompt_tokens, completion_tokens, total_tokens)):
+            return False
+
+        metrics.prompt_tokens = prompt_tokens
+        metrics.completion_tokens = completion_tokens
+        metrics.total_tokens = total_tokens
+
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(prompt_details, "cached_tokens", 0) if prompt_details is not None else 0
+        metrics.cached_tokens = cached if isinstance(cached, int) else 0
+        return True
+
     def _build_chat_kwargs(
         self,
         messages: List[Dict],
@@ -152,7 +173,168 @@ class LLMClient:
 
         return kwargs
 
-    def chat(self, messages: List[Dict], tools: Optional[List[Dict]] = None) -> tuple:
+    def _metrics_to_dict(self, metrics: 'LLMMetrics') -> Dict[str, Any]:
+        """Serialize metrics for logging."""
+        return {
+            "prompt_tokens": metrics.prompt_tokens,
+            "completion_tokens": metrics.completion_tokens,
+            "total_tokens": metrics.total_tokens,
+            "cached_tokens": metrics.cached_tokens,
+            "ttft": round(metrics.ttft, 6),
+            "duration": round(metrics.duration, 6),
+            "tokens_per_second": round(metrics.tokens_per_second, 6),
+            "tpot": round(metrics.tpot, 6),
+        }
+
+    def _safe_model_dump(self, value: Any) -> Optional[Dict[str, Any]]:
+        """Try to use model_dump(mode='json') when available."""
+        model_dump = getattr(value, "model_dump", None)
+        if not callable(model_dump):
+            return None
+
+        for kwargs in ({"mode": "json"}, {}):
+            try:
+                dumped = model_dump(**kwargs)
+            except Exception:
+                continue
+            if isinstance(dumped, dict):
+                return dumped
+        return None
+
+    def _serialize_usage(self, usage: Any) -> Optional[Dict[str, Any]]:
+        """Serialize a usage object into plain JSON-friendly data."""
+        dumped = self._safe_model_dump(usage)
+        if dumped is not None:
+            return dumped
+        if usage is None:
+            return None
+
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
+        cached_tokens = getattr(prompt_tokens_details, "cached_tokens", None) if prompt_tokens_details is not None else None
+
+        payload = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": cached_tokens,
+            } if cached_tokens is not None else None,
+        }
+        return payload
+
+    def _serialize_tool_call(self, tool_call: Any) -> Dict[str, Any]:
+        """Serialize a tool call into plain JSON-friendly data."""
+        dumped = self._safe_model_dump(tool_call)
+        if dumped is not None:
+            return dumped
+
+        function = getattr(tool_call, "function", None)
+        return {
+            "id": getattr(tool_call, "id", None),
+            "type": getattr(tool_call, "type", "function"),
+            "function": {
+                "name": getattr(function, "name", None),
+                "arguments": getattr(function, "arguments", None),
+            },
+        }
+
+    def _serialize_message(self, message: Any) -> Dict[str, Any]:
+        """Serialize an assistant message from the SDK response."""
+        dumped = self._safe_model_dump(message)
+        if dumped is not None:
+            return dumped
+
+        tool_calls = getattr(message, "tool_calls", None)
+        return {
+            "role": getattr(message, "role", None),
+            "content": getattr(message, "content", None),
+            "tool_calls": [self._serialize_tool_call(tool_call) for tool_call in tool_calls] if tool_calls else None,
+        }
+
+    def _serialize_choice(self, choice: Any) -> Dict[str, Any]:
+        """Serialize a response choice."""
+        dumped = self._safe_model_dump(choice)
+        if dumped is not None:
+            return dumped
+
+        return {
+            "index": getattr(choice, "index", 0),
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "message": self._serialize_message(getattr(choice, "message", None)),
+        }
+
+    def _serialize_response_payload(self, response: Any) -> Dict[str, Any]:
+        """Serialize the full response object for timeline logging."""
+        dumped = self._safe_model_dump(response)
+        if dumped is not None:
+            return dumped
+
+        choices = getattr(response, "choices", None) or []
+        return {
+            "id": getattr(response, "id", None),
+            "object": getattr(response, "object", "chat.completion"),
+            "created": getattr(response, "created", None),
+            "model": getattr(response, "model", self.model),
+            "choices": [self._serialize_choice(choice) for choice in choices],
+            "usage": self._serialize_usage(getattr(response, "usage", None)),
+        }
+
+    def _build_stream_response_payload(
+        self,
+        *,
+        role: str,
+        content: str,
+        tool_calls: List[Dict[str, Any]],
+        finish_reason: Optional[str],
+        chunk_count: int,
+    ) -> Dict[str, Any]:
+        """Build a reconstructed response payload for streaming logs."""
+        return {
+            "object": "chat.completion.stream.reconstructed",
+            "model": self.model,
+            "provider": self.provider,
+            "stream": True,
+            "chunk_count": chunk_count,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": finish_reason,
+                    "message": {
+                        "role": role,
+                        "content": content,
+                        "tool_calls": [
+                            {
+                                "id": tool_call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call["name"],
+                                    "arguments": tool_call["arguments"],
+                                },
+                            }
+                            for tool_call in tool_calls
+                        ] if tool_calls else None,
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": self._current_metrics.prompt_tokens,
+                "completion_tokens": self._current_metrics.completion_tokens,
+                "total_tokens": self._current_metrics.total_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": self._current_metrics.cached_tokens,
+                },
+            },
+        }
+
+    def chat(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[Dict]] = None,
+        log_context: Optional[Dict[str, Any]] = None,
+    ) -> tuple:
         """Send messages and get response with tool calls.
 
         Args:
@@ -170,25 +352,22 @@ class LLMClient:
             request_type="non-streaming"
         )
 
-        # Log request (logger handles disabled state internally)
-        if self.logger:
-            self.logger.log_llm_request(messages, tools, self.model, self.provider)
-
         kwargs = self._build_chat_kwargs(messages, tools, stream=False)
+
+        if self.logger and log_context:
+            self.logger.log_llm_request(
+                turn_id=log_context["turn_id"],
+                iteration=log_context["iteration"],
+                request_payload=kwargs,
+                provider=self.provider,
+                model=self.model,
+                stream=bool(log_context.get("stream", False)),
+            )
 
         response = self.client.chat.completions.create(**kwargs)
 
         # Extract usage information
-        if hasattr(response, 'usage') and response.usage:
-            metrics.prompt_tokens = response.usage.prompt_tokens
-            metrics.completion_tokens = response.usage.completion_tokens
-            metrics.total_tokens = response.usage.total_tokens
-
-            # Extract cached tokens if available
-            if hasattr(response.usage, 'prompt_tokens_details') and response.usage.prompt_tokens_details:
-                cached = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
-                metrics.cached_tokens = cached or 0
-        else:
+        if not self._apply_usage_metrics(metrics, getattr(response, "usage", None)):
             # Fallback: estimate tokens when API doesn't return usage
             metrics.prompt_tokens = self._estimate_prompt_tokens(messages)
             # For non-streaming, we can't accurately count completion tokens without usage
@@ -216,12 +395,25 @@ class LLMClient:
                 })
 
         # Log response
-        if self.logger:
-            self.logger.log_llm_response(result)
+        if self.logger and log_context:
+            self.logger.log_llm_response(
+                turn_id=log_context["turn_id"],
+                iteration=log_context["iteration"],
+                response_payload=self._serialize_response_payload(response),
+                provider=self.provider,
+                model=self.model,
+                stream=bool(log_context.get("stream", False)),
+                metrics=self._metrics_to_dict(metrics),
+            )
 
         return result, metrics
 
-    def chat_stream(self, messages: List[Dict], tools: Optional[List[Dict]] = None):
+    def chat_stream(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[Dict]] = None,
+        log_context: Optional[Dict[str, Any]] = None,
+    ):
         """Stream chat completion responses token-by-token.
 
         Args:
@@ -233,11 +425,17 @@ class LLMClient:
         """
         from src.metrics import LLMMetrics
 
-        # Log request
-        if self.logger:
-            self.logger.log_llm_request(messages, tools, self.model, self.provider)
-
         kwargs = self._build_chat_kwargs(messages, tools, stream=True)
+
+        if self.logger and log_context:
+            self.logger.log_llm_request(
+                turn_id=log_context["turn_id"],
+                iteration=log_context["iteration"],
+                request_payload=kwargs,
+                provider=self.provider,
+                model=self.model,
+                stream=bool(log_context.get("stream", True)),
+            )
 
         # Create metrics tracker
         self._current_metrics = LLMMetrics(
@@ -257,8 +455,11 @@ class LLMClient:
         full_role = "assistant"
         accumulated_tool_calls = {}
         first_content_token = True
+        final_finish_reason = None
+        chunk_count = 0
 
         for chunk in response:
+            chunk_count += 1
             choice = chunk.choices[0]
             delta = choice.delta
             finish_reason = choice.finish_reason
@@ -304,18 +505,11 @@ class LLMClient:
 
             # Signal when complete
             if finish_reason:
+                final_finish_reason = finish_reason
                 yield {"finish_reason": finish_reason}
 
                 # Extract usage from final chunk if available
-                if hasattr(chunk, 'usage') and chunk.usage:
-                    self._current_metrics.prompt_tokens = chunk.usage.prompt_tokens
-                    self._current_metrics.completion_tokens = chunk.usage.completion_tokens
-                    self._current_metrics.total_tokens = chunk.usage.total_tokens
-
-                    # Extract cached tokens if available
-                    if hasattr(chunk.usage, 'prompt_tokens_details') and chunk.usage.prompt_tokens_details:
-                        cached = getattr(chunk.usage.prompt_tokens_details, 'cached_tokens', 0)
-                        self._current_metrics.cached_tokens = cached or 0
+                self._apply_usage_metrics(self._current_metrics, getattr(chunk, "usage", None))
 
         # Always call finish() to record end time, regardless of usage availability
         self._current_metrics.finish()
@@ -330,12 +524,22 @@ class LLMClient:
         tool_calls_list = list(accumulated_tool_calls.values())
         tool_calls_list.sort(key=lambda x: x["id"])  # Sort by id to maintain order
 
-        if self.logger:
-            self.logger.log_llm_response({
-                "role": full_role,
-                "content": full_content,
-                "tool_calls": tool_calls_list if tool_calls_list else None
-            })
+        if self.logger and log_context:
+            self.logger.log_llm_response(
+                turn_id=log_context["turn_id"],
+                iteration=log_context["iteration"],
+                response_payload=self._build_stream_response_payload(
+                    role=full_role,
+                    content=full_content,
+                    tool_calls=tool_calls_list,
+                    finish_reason=final_finish_reason,
+                    chunk_count=chunk_count,
+                ),
+                provider=self.provider,
+                model=self.model,
+                stream=bool(log_context.get("stream", True)),
+                metrics=self._metrics_to_dict(self._current_metrics),
+            )
 
         # Store tool calls for retrieval by caller (eliminates need for duplicate API call)
         self._last_stream_tool_calls = tool_calls_list if tool_calls_list else []

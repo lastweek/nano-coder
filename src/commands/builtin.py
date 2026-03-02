@@ -4,7 +4,9 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
-from typing import Any
+from typing import Any, Optional
+
+from src.context_usage import build_context_usage_snapshot, format_token_count
 
 
 def _get_skill_dependencies(console: Console, context: Any):
@@ -31,6 +33,7 @@ def _print_skill_list(console: Console, skill_manager, session_context) -> None:
     table.add_column("Skill", style="green", width=20)
     table.add_column("Description", style="white", width=50)
     table.add_column("Source", style="dim", width=10)
+    table.add_column("Catalog", style="magenta", width=8)
     table.add_column("Active", style="cyan", width=8)
 
     for skill in skills:
@@ -38,6 +41,7 @@ def _print_skill_list(console: Console, skill_manager, session_context) -> None:
             skill.name,
             skill.short_description,
             skill.source,
+            "yes" if skill.catalog_visible else "no",
             "yes" if skill.name in active else "no",
         )
 
@@ -49,6 +53,13 @@ def _render_resource_inventory(paths) -> str:
     if not paths:
         return "  - none"
     return "\n".join(f"  - {path}" for path in paths)
+
+
+def _format_percentage(value: Optional[float]) -> str:
+    """Format a percentage for context usage tables."""
+    if value is None:
+        return "n/a"
+    return f"{value:.1f}%"
 
 
 def register_all(registry):
@@ -128,6 +139,80 @@ def register_all(registry):
             table.add_row(name, tool.description, params_str)
 
         console.print(table)
+
+    @registry.register(
+        "context",
+        "Show estimated context usage for the next LLM call",
+        args_description="",
+        short_desc="Show context usage"
+    )
+    def cmd_context(console: Console, args: str, context: Any):
+        """Show a repo-native next-call context usage estimate."""
+        agent = context.get("agent")
+        session_context = context.get("session_context")
+        skill_manager = context.get("skill_manager")
+
+        if agent is None or session_context is None:
+            console.print("[red]Agent and session context are required for /context[/red]")
+            return
+
+        snapshot = build_context_usage_snapshot(agent, session_context, skill_manager)
+
+        total_text = format_token_count(snapshot.context_window)
+        used_text = format_token_count(snapshot.used_tokens)
+        percentage_text = _format_percentage(snapshot.used_percentage)
+        summary_body = (
+            f"[bold]Model:[/bold] {snapshot.model}\n"
+            f"[bold]Tokens:[/bold] {used_text} / {total_text} ({percentage_text})"
+        )
+        console.print(Panel(summary_body, title="Context Usage", border_style="cyan"))
+
+        category_table = Table(title="Estimated usage by category", show_header=True, header_style="bold cyan")
+        category_table.add_column("Category", style="white", width=20)
+        category_table.add_column("Tokens", style="green", width=10)
+        category_table.add_column("Percentage", style="magenta", width=10)
+
+        for row in snapshot.categories:
+            category_table.add_row(
+                row.category,
+                format_token_count(row.tokens),
+                _format_percentage(row.percentage),
+            )
+
+        console.print(category_table)
+
+        if snapshot.tools:
+            tool_table = Table(title="Tool Schemas", show_header=True, header_style="bold cyan")
+            tool_table.add_column("Tool", style="green", width=30)
+            tool_table.add_column("Kind", style="white", width=18)
+            tool_table.add_column("Tokens", style="magenta", width=10)
+            for row in snapshot.tools:
+                tool_table.add_row(row.name, row.kind, format_token_count(row.tokens))
+            console.print(tool_table)
+
+        skill_rows = [row for row in snapshot.skills if row.tokens > 0]
+        if skill_rows:
+            skill_table = Table(title="Skills", show_header=True, header_style="bold cyan")
+            skill_table.add_column("Skill", style="green", width=25)
+            skill_table.add_column("Source", style="white", width=10)
+            skill_table.add_column("Usage", style="cyan", width=10)
+            skill_table.add_column("Tokens", style="magenta", width=10)
+            for row in skill_rows:
+                skill_table.add_row(row.name, row.source, row.usage_type, format_token_count(row.tokens))
+            console.print(skill_table)
+
+        if snapshot.messages:
+            message_table = Table(title="Messages", show_header=True, header_style="bold cyan")
+            message_table.add_column("#", style="white", width=4)
+            message_table.add_column("Role", style="green", width=10)
+            message_table.add_column("Tokens", style="magenta", width=10)
+            message_table.add_column("Preview", style="white", width=60)
+            for row in snapshot.messages:
+                message_table.add_row(str(row.index), row.role, format_token_count(row.tokens), row.preview)
+            console.print(message_table)
+
+        for note in snapshot.notes:
+            console.print(f"[dim]{note}[/dim]")
 
     @registry.register(
         "mcp",
@@ -264,6 +349,7 @@ def register_all(registry):
             body = "\n".join([
                 f"[bold]Description:[/bold] {skill.description}",
                 f"[bold]Source:[/bold] {skill.source}",
+                f"[bold]Catalog Visible:[/bold] {'yes' if skill.catalog_visible else 'no'}",
                 f"[bold]Skill File:[/bold] {skill.skill_file}",
                 f"[bold]Body Lines:[/bold] {line_info}",
                 "",
@@ -293,6 +379,10 @@ def register_all(registry):
 
             for skill_name in removed:
                 console.print(f"[yellow]Removed missing pinned skill: {skill_name}[/yellow]")
+
+            input_helper = context.get("input_helper")
+            if input_helper is not None:
+                input_helper.update_skills([skill.name for skill in skill_manager.list_skills()])
 
             console.print(f"[green]Reloaded {len(skill_manager.list_skills())} skill(s)[/green]")
             return

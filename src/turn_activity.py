@@ -1,0 +1,54 @@
+"""Turn activity events for live CLI progress display."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from time import perf_counter
+from typing import Any, Callable, Literal, Optional
+
+
+TurnActivityKind = Literal[
+    "skill_preload",
+    "skill_normalized",
+    "skill_load_requested",
+    "skill_load_succeeded",
+    "skill_load_failed",
+    "llm_call_started",
+    "llm_call_finished",
+    "tool_call_started",
+    "tool_call_finished",
+    "answer_stream_started",
+    "turn_completed",
+    "turn_error",
+]
+
+
+@dataclass(frozen=True)
+class TurnActivityEvent:
+    """A user-safe activity event emitted during a turn.
+
+    `details` keys by event kind:
+    - `skill_preload`: `skill_name`, `reason`, `source`, `catalog_visible`
+    - `skill_normalized`: `content`, `reason`
+    - `skill_load_requested`: `skill_name`
+    - `skill_load_succeeded`: `skill_name`
+    - `skill_load_failed`: `skill_name`, `error`
+    - `llm_call_started`: `stream`, `message_count`, `tool_schema_count`
+    - `llm_call_finished`: `stream`, `duration_s`, `prompt_tokens`,
+      `completion_tokens`, `total_tokens`, `cached_tokens`, `has_tool_calls`,
+      `tool_call_count`, `result_kind`
+    - `tool_call_started`: `tool_name`, `tool_call_id`, `arguments`
+    - `tool_call_finished`: `tool_name`, `tool_call_id`, `arguments`, `success`,
+      `duration_s`, optional `error`
+    - `turn_completed`: `status`, `llm_call_count`, `tool_call_count`,
+      `tools_used`, `skills_used`
+    - `turn_error`: `phase`, `message`
+    """
+
+    kind: TurnActivityKind
+    iteration: Optional[int] = None
+    timestamp: float = field(default_factory=perf_counter)
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+TurnActivityCallback = Callable[[TurnActivityEvent], None]

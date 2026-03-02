@@ -15,8 +15,11 @@ from prompt_toolkit.output.base import Output
 from prompt_toolkit.shortcuts import CompleteStyle
 
 
-def _get_active_slash_fragment(document: Document) -> Optional[Tuple[str, int]]:
-    """Get the active slash fragment before the cursor."""
+def _get_active_prefixed_fragment(
+    document: Document,
+    prefix: str,
+) -> Optional[Tuple[str, int]]:
+    """Get the active token fragment that starts with the given prefix."""
     text = document.text_before_cursor
     if not text:
         return None
@@ -26,55 +29,69 @@ def _get_active_slash_fragment(document: Document) -> Optional[Tuple[str, int]]:
         token_start -= 1
 
     token = text[token_start:]
-    slash_index = token.rfind("/")
-    if slash_index == -1:
+    prefix_index = token.rfind(prefix)
+    if prefix_index == -1:
         return None
 
-    fragment = token[slash_index:]
+    fragment = token[prefix_index:]
     if not fragment:
         return None
 
     return fragment, -len(fragment)
 
 
-class SlashCommandCompleter(Completer):
-    """Prefix-based slash command completer."""
+def _get_active_slash_fragment(document: Document) -> Optional[Tuple[str, int]]:
+    """Get the active slash fragment before the cursor."""
+    return _get_active_prefixed_fragment(document, "/")
 
-    def __init__(self, command_names: List[str], descriptions: dict):
-        """Initialize slash command completer.
+
+def _get_active_skill_fragment(document: Document) -> Optional[Tuple[str, int]]:
+    """Get the active $skill fragment before the cursor."""
+    return _get_active_prefixed_fragment(document, "$")
+
+
+class PrefixCommandCompleter(Completer):
+    """Prefix-based completer for slash commands and $skills."""
+
+    def __init__(
+        self,
+        prefix: str,
+        names: List[str],
+        descriptions: Optional[Dict[str, str]] = None,
+    ):
+        """Initialize a prefix-aware completer.
 
         Args:
-            command_names: List of command names (without /)
-            descriptions: Dict mapping command names to short descriptions
+            prefix: Trigger prefix, such as / or $
+            names: List of candidate names without the prefix
+            descriptions: Optional descriptions for completion metadata
         """
-        self.command_names = list(command_names)
-        self.descriptions = dict(descriptions)
+        self.prefix = prefix
+        self.names = list(names)
+        self.descriptions = dict(descriptions or {})
 
     def get_completions(
         self,
         document: Document,
         complete_event: CompleteEvent
     ):
-        """Get completions for the active slash fragment."""
-        active_fragment = _get_active_slash_fragment(document)
+        """Get completions for the active prefixed fragment."""
+        active_fragment = _get_active_prefixed_fragment(document, self.prefix)
         if active_fragment is None:
             return []
 
         fragment, start_position = active_fragment
         query = fragment[1:].lower()
 
-        for command_name in self.command_names:
-            if query and not command_name.lower().startswith(query):
+        for name in self.names:
+            if query and not name.lower().startswith(query):
                 continue
 
-            description = self.descriptions.get(
-                command_name,
-                f"Run {command_name} command"
-            )
+            description = self.descriptions.get(name, "")
             yield Completion(
-                text=f"/{command_name}",
+                text=f"{self.prefix}{name}",
                 start_position=start_position,
-                display=f"/{command_name}",
+                display=f"{self.prefix}{name}",
                 display_meta=description,
             )
 
@@ -87,6 +104,7 @@ class InputHelper:
         history_file: Optional[Path] = None,
         command_names: Optional[List[str]] = None,
         command_descriptions: Optional[dict] = None,
+        skill_names: Optional[List[str]] = None,
         mouse_support: bool = False,
         input: Optional[Input] = None,
         output: Optional[Output] = None,
@@ -97,6 +115,7 @@ class InputHelper:
             history_file: Path to command history file (default: ~/.nano-coder-history)
             command_names: List of command names for tab completion (without /)
             command_descriptions: Dict mapping command names to short descriptions
+            skill_names: List of skill names for $skill completion (without $)
             mouse_support: Whether prompt_toolkit mouse tracking is enabled
             input: Optional prompt_toolkit input for testing
             output: Optional prompt_toolkit output for testing
@@ -107,14 +126,21 @@ class InputHelper:
         self.history = FileHistory(str(history_file))
         self.command_names = list(command_names or [])
         self.command_descriptions = dict(command_descriptions or {})
+        self.skill_names = list(skill_names or [])
 
         self.command_completer = self._build_command_completer()
+        self.skill_completer = self._build_skill_completer()
         kb = KeyBindings()
 
         @kb.add("/")
         def _(event):
             """Insert slash and immediately open the command menu."""
             self._handle_slash(event.app.current_buffer)
+
+        @kb.add("$")
+        def _(event):
+            """Insert dollar sign and immediately open the skill menu."""
+            self._handle_dollar(event.app.current_buffer)
 
         @kb.add("down", filter=has_completions)
         def _(event):
@@ -152,30 +178,48 @@ class InputHelper:
         )
         self.session.default_buffer.on_text_changed += self._on_buffer_text_changed
 
-    def _build_command_completer(self) -> Optional[SlashCommandCompleter]:
+    def _build_command_completer(self) -> Optional[PrefixCommandCompleter]:
         """Build the current slash command completer."""
         if not self.command_names:
             return None
 
-        return SlashCommandCompleter(
-            command_names=self.command_names,
+        return PrefixCommandCompleter(
+            prefix="/",
+            names=self.command_names,
             descriptions=self.command_descriptions,
+        )
+
+    def _build_skill_completer(self) -> Optional[PrefixCommandCompleter]:
+        """Build the current $skill completer."""
+        if not self.skill_names:
+            return None
+
+        return PrefixCommandCompleter(
+            prefix="$",
+            names=self.skill_names,
+            descriptions={
+                name: f"Preload {name} for this turn"
+                for name in self.skill_names
+            },
         )
 
     def _get_document_completions(self, document: Document) -> List[Completion]:
         """Get completions for the current document."""
-        if self.command_completer is None:
-            return []
-
         complete_event = CompleteEvent(completion_requested=True)
-        return list(self.command_completer.get_completions(document, complete_event))
+        if _get_active_slash_fragment(document) is not None and self.command_completer is not None:
+            return list(self.command_completer.get_completions(document, complete_event))
+
+        if _get_active_skill_fragment(document) is not None and self.skill_completer is not None:
+            return list(self.skill_completer.get_completions(document, complete_event))
+
+        return []
 
     def _refresh_completion_menu(self, buffer, *, select_first: bool) -> None:
         """Refresh slash command completions for the current buffer."""
-        if self.command_completer is None:
-            return
-
-        if _get_active_slash_fragment(buffer.document) is None:
+        if (
+            _get_active_slash_fragment(buffer.document) is None
+            and _get_active_skill_fragment(buffer.document) is None
+        ):
             buffer.cancel_completion()
             return
 
@@ -203,6 +247,11 @@ class InputHelper:
     def _handle_slash(self, buffer) -> None:
         """Insert slash and open command completions for the new fragment."""
         buffer.insert_text("/")
+        self._refresh_completion_menu(buffer, select_first=True)
+
+    def _handle_dollar(self, buffer) -> None:
+        """Insert dollar sign and open skill completions for the new fragment."""
+        buffer.insert_text("$")
         self._refresh_completion_menu(buffer, select_first=True)
 
     def _move_completion_next(self, buffer) -> None:
@@ -250,6 +299,15 @@ class InputHelper:
 
         self.command_completer = self._build_command_completer()
         self.session.completer = self.command_completer
+        self._refresh_completion_menu(
+            self.session.default_buffer,
+            select_first=self.session.default_buffer.complete_state is not None,
+        )
+
+    def update_skills(self, skill_names: List[str]) -> None:
+        """Update skill completer with new skill names."""
+        self.skill_names = list(skill_names or [])
+        self.skill_completer = self._build_skill_completer()
         self._refresh_completion_menu(
             self.session.default_buffer,
             select_first=self.session.default_buffer.complete_state is not None,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional
@@ -26,6 +28,7 @@ class SkillSpec:
     root_dir: Path
     skill_file: Path
     source: SkillSource
+    catalog_visible: bool
     scripts: List[Path]
     references: List[Path]
     assets: List[Path]
@@ -88,7 +91,15 @@ class SkillManager:
 
     def list_skills(self) -> List[SkillSpec]:
         """Return discovered skills."""
-        return list(self._skills.values())
+        return sorted(self._skills.values(), key=lambda skill: skill.name)
+
+    def list_catalog_skills(self) -> List[SkillSpec]:
+        """Return the predefined repo-local skills shown in the system prompt."""
+        return [
+            skill
+            for skill in self.list_skills()
+            if skill.catalog_visible
+        ]
 
     def get_skill(self, name: str) -> Optional[SkillSpec]:
         """Return a discovered skill by name."""
@@ -98,31 +109,61 @@ class SkillManager:
         """Return warnings from the last discovery run."""
         return list(self._warnings)
 
+    def extract_skill_mentions(self, text: str) -> "SkillMentionParseResult":
+        """Parse explicit $skill-name mentions from user text."""
+        found: List[str] = []
+
+        def replacer(match: re.Match) -> str:
+            skill_name = match.group(1)
+            if skill_name not in self._skills:
+                return match.group(0)
+
+            if skill_name not in found:
+                found.append(skill_name)
+            return ""
+
+        cleaned = re.sub(r"\$([A-Za-z0-9][A-Za-z0-9_-]*)\b", replacer, text)
+        cleaned = " ".join(cleaned.split())
+        return SkillMentionParseResult(skill_names=found, cleaned_text=cleaned)
+
+    def build_preload_messages(self, skill_names: List[str]) -> List[dict]:
+        """Build deterministic synthetic assistant/tool messages for skill preloads."""
+        messages: List[dict] = []
+
+        for index, skill_name in enumerate(skill_names, start=1):
+            skill = self.get_skill(skill_name)
+            if skill is None:
+                continue
+
+            tool_call_id = f"skill_preload_{index}_{skill.name}"
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "load_skill",
+                            "arguments": json.dumps({"skill_name": skill.name}),
+                        },
+                    }
+                ],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({"output": self._format_skill_payload(skill)}),
+            })
+
+        return messages
+
     def format_skill_for_tool(self, name: str) -> str:
         """Format a skill payload for the agent tool result."""
         skill = self.get_skill(name)
         if skill is None:
             raise KeyError(name)
         return self._format_skill_payload(skill)
-
-    def format_skill_for_prompt(self, name: str) -> Optional[str]:
-        """Format a pinned skill block for the system prompt."""
-        skill = self.get_skill(name)
-        if skill is None:
-            return None
-
-        lines = [
-            f"[Skill: {skill.name}]",
-            f"Description: {skill.description}",
-            "Instructions:",
-            skill.body,
-        ]
-
-        resources = self._resource_lines(skill)
-        if resources:
-            lines.extend(["Resources:"] + resources)
-
-        return "\n".join(lines).strip()
 
     def _load_skill_file(
         self,
@@ -164,6 +205,7 @@ class SkillManager:
             root_dir=root_dir,
             skill_file=skill_file.resolve(),
             source=source,
+            catalog_visible=True,
             scripts=self._inventory_resources(root_dir / "scripts"),
             references=self._inventory_resources(root_dir / "references"),
             assets=self._inventory_resources(root_dir / "assets"),
@@ -226,19 +268,6 @@ class SkillManager:
         ]
         return "\n".join(sections).strip()
 
-    def _resource_lines(self, skill: SkillSpec) -> List[str]:
-        lines: List[str] = []
-        for label, paths in (
-            ("Scripts", skill.scripts),
-            ("References", skill.references),
-            ("Assets", skill.assets),
-        ):
-            if not paths:
-                continue
-            lines.append(f"{label}:")
-            lines.extend(f"- {path}" for path in paths)
-        return lines
-
     def _resource_group(self, label: str, paths: Iterable[Path]) -> List[str]:
         lines = [f"{label}:"]
         entries = [f"- {path}" for path in paths]
@@ -282,3 +311,11 @@ class LoadSkillTool(Tool):
             return ToolResult(success=False, error=f"Unknown skill: {skill_name}")
 
         return ToolResult(success=True, data=payload)
+
+
+@dataclass
+class SkillMentionParseResult:
+    """Parsed explicit skill mentions from a user message."""
+
+    skill_names: List[str]
+    cleaned_text: str

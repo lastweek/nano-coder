@@ -86,24 +86,37 @@ What to do instead of committing a secret:
 
 ## Logging
 
-Nano-Coder automatically logs all chat completions and tool executions for debugging.
+Nano-Coder automatically logs each CLI run into a session directory under `logs/`.
 
-### Log Format
+### Session Layout
 
-Logs are saved in JSONL format (one JSON object per line) in the `logs/` directory.
+Each new session creates:
 
-### Log Files
+- `logs/session-{timestamp}-{session_id}/session.json` - session metadata and aggregate counts
+- `logs/session-{timestamp}-{session_id}/llm.log` - complete readable execution timeline with full LLM request/response JSON plus inline tool and skill activity
+- `logs/session-{timestamp}-{session_id}/events.jsonl` - structured turn, tool, skill, and error events
+- `logs/session-{timestamp}-{session_id}/artifacts/` - oversized non-LLM payloads that were spilled out of `events.jsonl`
 
-- `logs/session-{id}-{timestamp}.jsonl` - Per-session log file
-- `logs/latest.jsonl` - Symlink to the most recent session
+Convenience symlinks are updated on each run:
+
+- `logs/latest-session` - symlink to the newest session directory
+- `logs/latest.log` - symlink to the newest session's `llm.log`
 
 ### What Gets Logged
 
-- User messages
-- LLM requests (messages, tools, model, provider)
-- LLM responses (content, tool_calls)
-- Tool executions (name, arguments, results)
-- Final agent responses
+- Session metadata and counters in `session.json`
+- Full outgoing LLM request payload JSON in `llm.log`
+- Full parsed or reconstructed LLM response JSON in `llm.log`
+- Inline turn boundaries, tool calls/results, skill events, and errors in `llm.log`
+- Turn lifecycle, tool calls/results, skill events, and structured errors in `events.jsonl`
+- Large non-LLM payloads in `artifacts/` when they would otherwise bloat `events.jsonl`
+
+### Reading Logs Quickly
+
+- Start with `session.json` for the high-level session overview
+- Open `llm.log` when you want the full chronological execution timeline for a session
+- Use `events.jsonl` for structured non-LLM chronology
+- Check `artifacts/` only when an event references a spilled payload
 
 ### Disabling Logging
 
@@ -180,7 +193,7 @@ Use `pdfplumber`, `pypdf`, and rendered page checks when layout matters.
 
 ### Slash Commands
 
-- `/skill` lists discovered skills and whether they are pinned for the session
+- `/skill` lists discovered skills, whether they are part of the current session catalog, and whether they are pinned for the session
 - `/skill use <name>` pins a skill for the session
 - `/skill clear <name>` unpins one skill
 - `/skill clear all` unpins all session skills
@@ -189,21 +202,24 @@ Use `pdfplumber`, `pypdf`, and rendered page checks when layout matters.
 
 ### Agent Behavior
 
-- Skill metadata is always available to the agent in compact form
-- Full skill instructions are only loaded when:
-  - you pin a skill with `/skill use <name>`
+- The system prompt contains a stable **skill catalog** for discovered skills in the current session:
+  - skill name
+  - short description
+- This includes repo-local and user-global skills after duplicate resolution
+- Full `SKILL.md` **skill bodies** are only loaded when:
   - the agent calls the built-in `load_skill` tool during the current turn
+  - you explicitly preload a skill with `$skill-name`
+- Pinned skills from `/skill use <name>` stay available across turns, but their full bodies are injected later in the message list instead of being baked into the first system prompt
 - Loading a skill does not execute bundled scripts automatically
+- `scripts/`, `references/`, and `assets/` are inventoried as paths only; their contents are loaded only if the agent later reads them with tools
+- Set `SKILL_DEBUG=1` to print skill preload/load debug lines in the CLI while also recording structured `skill_event` entries in the session log
 
 ### Example Skill Session
 
 ```text
-You > explain this PDF form workflow
+You > $pdf explain this PDF form workflow
 
-Agent > I should load the PDF skill for this task.
-  → load_skill(skill_name='pdf')
-
-Here is the PDF-specific workflow to follow...
+Agent > Here is the PDF-specific workflow to follow...
 ```
 
 ## Usage

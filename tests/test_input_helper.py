@@ -8,7 +8,11 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from src.input_helper import InputHelper, _get_active_slash_fragment
+from src.input_helper import (
+    InputHelper,
+    _get_active_skill_fragment,
+    _get_active_slash_fragment,
+)
 
 
 @contextmanager
@@ -25,6 +29,7 @@ def create_input_helper(tmp_path, *, mouse_support=False):
                     "tool": "List available tools",
                     "mcp": "List MCP servers",
                 },
+                skill_names=["pdf", "terraform"],
                 mouse_support=mouse_support,
                 input=pipe_input,
                 output=output,
@@ -46,6 +51,15 @@ def test_get_active_slash_fragment_cases():
     assert _get_active_slash_fragment(Document("foo / bar", 9)) is None
 
 
+def test_get_active_skill_fragment_cases():
+    """Skill fragment detection should track the current token only."""
+    assert _get_active_skill_fragment(Document("$", 1)) == ("$", -1)
+    assert _get_active_skill_fragment(Document("$pd", 3)) == ("$pd", -3)
+    assert _get_active_skill_fragment(Document("use $pd", 7)) == ("$pd", -3)
+    assert _get_active_skill_fragment(Document("$HOME/path", 10)) == ("$HOME/path", -10)
+    assert _get_active_skill_fragment(Document("$ pdf", 5)) is None
+
+
 def test_get_document_completions_match_current_fragment(tmp_path):
     """Completions should be prefix matched against the active slash fragment."""
     with create_input_helper(tmp_path) as (helper, _pipe_input, _output):
@@ -59,6 +73,14 @@ def test_get_document_completions_match_current_fragment(tmp_path):
         ]
         assert helper._get_document_completions(Document("/tmp/path", 9)) == []
         assert helper._get_document_completions(Document("cd /tm", 6)) == []
+        assert [c.text for c in helper._get_document_completions(Document("$", 1))] == [
+            "$pdf",
+            "$terraform",
+        ]
+        assert [c.text for c in helper._get_document_completions(Document("$p", 2))] == [
+            "$pdf"
+        ]
+        assert helper._get_document_completions(Document("$HOME", 5)) == []
 
 
 def test_input_helper_defaults_mouse_support_off(tmp_path):
@@ -89,6 +111,24 @@ def test_handle_slash_opens_menu_and_tab_inserts_selected_command(tmp_path):
 
         helper._accept_completion(buffer)
         assert buffer.text == "foo/tool"
+
+
+def test_handle_dollar_opens_menu_and_tab_inserts_selected_skill(tmp_path):
+    """Dollar should open the menu and accepted completion should replace only the fragment."""
+    with create_input_helper(tmp_path) as (helper, _pipe_input, _output):
+        buffer = create_buffer("use ")
+
+        helper._handle_dollar(buffer)
+
+        assert buffer.text == "use $"
+        assert buffer.complete_state is not None
+        assert buffer.complete_state.current_completion.text == "$pdf"
+
+        helper._move_completion_next(buffer)
+        assert buffer.complete_state.current_completion.text == "$terraform"
+
+        helper._accept_completion(buffer)
+        assert buffer.text == "use $terraform"
 
 
 def test_completion_replaces_only_active_fragment(tmp_path):
@@ -140,6 +180,17 @@ def test_update_commands_preserves_slash_aware_completer(tmp_path):
         assert completions[0].display_meta_text == "Deploy the application"
 
 
+def test_update_skills_preserves_skill_completion(tmp_path):
+    """Updating skills should keep $skill completion behavior."""
+    with create_input_helper(tmp_path) as (helper, _pipe_input, _output):
+        helper.update_skills(["postgres"])
+
+        completions = helper._get_document_completions(Document("$p", 2))
+
+        assert [c.text for c in completions] == ["$postgres"]
+        assert completions[0].display_meta_text == "Preload postgres for this turn"
+
+
 def test_get_input_round_trips_paths(tmp_path):
     """Prompt input should still allow slash-prefixed paths and inline slashes."""
     with create_input_helper(tmp_path) as (helper, pipe_input, _output):
@@ -148,3 +199,10 @@ def test_get_input_round_trips_paths(tmp_path):
 
         pipe_input.send_text("foo/bar\n")
         assert helper.get_input("> ") == "foo/bar"
+
+
+def test_get_input_round_trips_unmatched_dollar_tokens(tmp_path):
+    """Unknown $tokens should remain normal input text."""
+    with create_input_helper(tmp_path) as (helper, pipe_input, _output):
+        pipe_input.send_text("$HOME/path\n")
+        assert helper.get_input("> ") == "$HOME/path"

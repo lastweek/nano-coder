@@ -1,169 +1,237 @@
 # Nano-Coder
 
-A minimalism terminal-based AI code agent with support for multiple LLM providers.
+Nano-Coder is a terminal-based coding agent for working directly inside a repository. It combines an OpenAI-compatible LLM client with tool use for reading files, writing files, running shell commands, loading skills, and calling MCP servers from the same CLI session.
 
-## Features
+The project is built for practical repo work: you get a live activity feed while the agent is running, structured per-session logs after each turn, and slash commands for inspecting tools, skills, MCP servers, and estimated context usage.
 
-- 🤖 Conversational coding assistant
-- 📁 Read and write files
-- 💻 Execute shell commands
-- 🎯 Clean terminal interface
-- 🔄 ReAct loop for tool orchestration
+## Why Nano-Coder
 
-## Installation
+- Terminal-first workflow for staying in your shell and repository
+- Tool-based code tasks with `read_file`, `write_file`, and `run_command`
+- Streaming answers plus a live activity feed while the agent is thinking
+- MCP support for external tool servers such as DeepWiki
+- Local skill system with cataloging, pinning, and on-demand loading
+- Per-session logging with `session.json`, `llm.log`, and `events.jsonl`
+- `/context` command for estimating next-call baseline context usage
+
+## Quickstart
+
+### Install
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Set up your environment
-cp .env.example .env
-# Edit .env with your configuration
-
-# Install repo-local git hooks
 git config core.hooksPath .githooks
 ```
+
+### Configure
+
+Start from the example config:
+
+```bash
+cp config.yaml.example config.yaml
+cp .env.example .env
+```
+
+`config.yaml` is the main configuration file. `.env` is useful for secrets and local overrides. Environment variables override values from `config.yaml`.
+
+Minimal OpenAI-compatible example:
+
+```yaml
+llm:
+  provider: custom
+  model: your-model-name
+  base_url: https://api.example.com/v1
+  api_key: your-api-key
+```
+
+### Run
+
+```bash
+python -m src.main
+```
+
+Alternative:
+
+```bash
+python src/main.py
+```
+
+## Example Session
+
+```text
+You > explain how the logging system works
+
+Agent >
+  • LLM call 1 requested 2 tools
+  • Tool finished: run_command(cmd='rg "SessionLogger" -n src') (0.03s)
+  • Tool finished: read_file(file_path='src/logger.py') (0.00s)
+  • LLM call 2 produced final answer
+
+Nano-Coder writes one session directory per CLI run, with `session.json` for metadata,
+`llm.log` for the full execution timeline, and `events.jsonl` for structured events.
+
+1234 prompt tokens • 87 completion tokens • 2.14s • TTFT 0.61s • glm-5 (custom)
+```
+
+## Core Capabilities
+
+### Built-in tools
+
+Nano-Coder ships with built-in tools for reading files, writing files, and running shell commands. The agent uses them through the same tool-calling loop as MCP tools and skills.
+
+### MCP integration
+
+MCP servers are configured in `config.yaml` and loaded at startup. Their tools appear alongside built-in tools and can be inspected with `/mcp`.
+
+### Skills
+
+Skills provide reusable local instructions through `SKILL.md` bundles. Nano-Coder keeps a compact skill catalog in context and loads full skill bodies only when they are pinned, explicitly requested with `$skill-name`, or loaded by the agent with `load_skill`.
+
+### Logging
+
+Each CLI run creates a per-session log directory. `llm.log` is the primary human-readable execution timeline, `events.jsonl` is the structured companion log, and `session.json` stores session metadata and aggregate counts.
+
+### Context inspection
+
+`/context` shows an estimated next-call baseline for the current session, broken down by system prompt, tool schemas, skill catalog, pinned skills, and persisted messages.
+
+## How It Works
+
+Nano-Coder uses a ReAct-style loop:
+
+1. Build the system prompt, tool schemas, skill catalog, pinned skill preloads, and message history.
+2. Send the request to the model.
+3. If the model asks for tools, execute them and append the results.
+4. Repeat until the model returns a final answer.
+5. Stream or print the final answer in the CLI and log the turn.
+
+Skills fit into the same flow: the catalog is available up front, and full `SKILL.md` bodies are loaded later only when needed. MCP tools participate through the same tool registry as built-in tools.
 
 ## Configuration
 
-Create a `.env` file from the example and configure your LLM provider:
+### Config sources and precedence
 
-### Using OpenAI
+Nano-Coder uses:
 
-```bash
-LLM_PROVIDER=openai
-OPENAI_API_KEY=sk-...
-MODEL=gpt-4
+- `config.yaml` for primary local configuration
+- `.env` for secrets and values that are not committed
+- environment variables for explicit overrides
+
+In practice, treat `config.yaml` as the main config file. Use `.env` for credentials, and use environment variables when you need to override file-based settings for a specific run or machine.
+
+### LLM providers
+
+Supported provider modes:
+
+- `openai`
+- `azure`
+- `ollama`
+- `custom`
+
+Core fields:
+
+- `llm.provider`
+- `llm.model`
+- `llm.base_url`
+- `llm.api_key`
+- `llm.context_window` (optional)
+
+Examples:
+
+```yaml
+llm:
+  provider: openai
+  model: gpt-4.1
+  api_key: your-openai-key
 ```
 
-### Using Azure OpenAI
-
-```bash
-LLM_PROVIDER=azure
-AZURE_API_KEY=your-azure-key
-BASE_URL=https://your-resource.openai.azure.com
-MODEL=your-deployment-name
+```yaml
+llm:
+  provider: azure
+  model: your-deployment-name
+  base_url: https://your-resource.openai.azure.com
+  api_key: your-azure-key
 ```
 
-### Using Ollama (Local)
-
-```bash
-LLM_PROVIDER=ollama
-BASE_URL=http://localhost:11434/v1
-MODEL=llama2
-# No API key needed for Ollama
+```yaml
+llm:
+  provider: ollama
+  model: llama3
+  base_url: http://localhost:11434/v1
 ```
 
-### Using Custom OpenAI-Compatible Endpoint
-
-```bash
-LLM_PROVIDER=custom
-CUSTOM_API_KEY=your-key-if-needed
-BASE_URL=https://your-api-endpoint.com
-MODEL=your-model-name
+```yaml
+llm:
+  provider: custom
+  model: glm-5
+  base_url: https://api.example.com/v1
+  api_key: your-api-key
 ```
 
-## Secret Guardrail
+### UI and agent settings
 
-This repo includes git hooks that block commits and pushes when they contain values that look like real API keys or tokens.
+Useful config knobs:
 
-Enable them in your local clone:
+- `ui.enable_streaming`
+- `agent.max_iterations`
+- `logging.enabled`
+- `logging.async_mode`
+- `logging.log_dir`
 
-```bash
-git config core.hooksPath .githooks
+### MCP server config
+
+MCP servers live under `mcp.servers` in `config.yaml`:
+
+```yaml
+mcp:
+  servers:
+    - name: deepwiki
+      url: https://mcp.deepwiki.com/mcp
+      enabled: true
+      timeout: 30
 ```
 
-What the guard checks:
+## Slash Commands
 
-- Added lines in staged changes before `git commit`
-- Added lines in commits that are about to be sent during `git push`
+Nano-Coder supports built-in slash commands that bypass the agent:
 
-What to do instead of committing a secret:
+- `/help` - list commands
+- `/tool` - list available tools
+- `/mcp` - inspect MCP servers and MCP-provided tools
+- `/skill` - list, pin, unpin, inspect, and reload skills
+- `/context` - estimate next-call baseline context usage
 
-- Put real credentials in `.env`
-- Keep `.env.example` on placeholders only
-- Reference secrets from environment variables in example scripts
+### `/skill`
 
-## Logging
+Supported forms:
 
-Nano-Coder automatically logs each CLI run into a session directory under `logs/`.
+- `/skill`
+- `/skill use <name>`
+- `/skill clear <name>`
+- `/skill clear all`
+- `/skill show <name>`
+- `/skill reload`
 
-### Session Layout
+### `/context`
 
-Each new session creates:
-
-- `logs/session-{timestamp}-{session_id}/session.json` - session metadata and aggregate counts
-- `logs/session-{timestamp}-{session_id}/llm.log` - complete readable execution timeline with full LLM request/response JSON plus inline tool and skill activity
-- `logs/session-{timestamp}-{session_id}/events.jsonl` - structured turn, tool, skill, and error events
-- `logs/session-{timestamp}-{session_id}/artifacts/` - oversized non-LLM payloads that were spilled out of `events.jsonl`
-
-Convenience symlinks are updated on each run:
-
-- `logs/latest-session` - symlink to the newest session directory
-- `logs/latest.log` - symlink to the newest session's `llm.log`
-
-### What Gets Logged
-
-- Session metadata and counters in `session.json`
-- Full outgoing LLM request payload JSON in `llm.log`
-- Full parsed or reconstructed LLM response JSON in `llm.log`
-- Inline turn boundaries, tool calls/results, skill events, and errors in `llm.log`
-- Turn lifecycle, tool calls/results, skill events, and structured errors in `events.jsonl`
-- Large non-LLM payloads in `artifacts/` when they would otherwise bloat `events.jsonl`
-
-### Reading Logs Quickly
-
-- Start with `session.json` for the high-level session overview
-- Open `llm.log` when you want the full chronological execution timeline for a session
-- Use `events.jsonl` for structured non-LLM chronology
-- Check `artifacts/` only when an event references a spilled payload
-
-### Disabling Logging
-
-Set `ENABLE_LOGGING=false` in your `.env` file to disable logging.
-
-## Streaming Output
-
-Nano-Coder supports streaming output for real-time token-by-token response display, similar to ChatGPT.
-
-### Enabling Streaming
-
-Streaming is enabled by default. To disable it:
-
-```bash
-# In your .env file
-ENABLE_STREAMING=false
-```
-
-### How Streaming Works
-
-When `ENABLE_STREAMING=true`:
-- LLM responses appear token-by-token as they're generated
-- You see the response in real-time instead of waiting for the complete message
-- Tool executions still display normally during streaming
-
-When `ENABLE_STREAMING=false`:
-- A "Thinking..." indicator shows while waiting for the LLM
-- The complete response appears at once when finished
-
-### Performance
-
-Streaming provides better perceived performance (instant feedback) but requires:
-- OpenAI-compatible API that supports streaming (most do)
-- Slightly more CPU for real-time rendering
+`/context` estimates the baseline payload for the next LLM call before any new user message is added. The numbers are approximate and exclude the next user message and any explicit `$skill-name` preload for that future turn.
 
 ## Skills
 
-Nano-Coder supports local Codex-style skill bundles for domain-specific workflows and reusable instructions.
+### What skills are
 
-### Discovery Roots
+Skills are local instruction bundles stored in `SKILL.md`. They let the agent or user bring in domain-specific workflows without putting the full instructions into every turn up front.
 
-- Repo-local: `.nano-coder/skills`
-- User-global: `~/.nano-coder/skills`
+### Discovery roots
 
-If a repo-local skill and a user-global skill share the same `name`, the repo-local skill wins.
+Nano-Coder discovers skills from:
 
-### Skill Layout
+- `.nano-coder/skills`
+- `~/.nano-coder/skills`
+
+If the same skill name exists in both places, the repo-local copy wins.
+
+### Skill layout
 
 ```text
 skill-name/
@@ -174,11 +242,11 @@ skill-name/
 └── agents/
 ```
 
-Only `SKILL.md` is required. `scripts/`, `references/`, and `assets/` are optional and are inventoried automatically. `agents/` is ignored by the runtime.
+Only `SKILL.md` is required. `scripts/`, `references/`, and `assets/` are optional. `agents/` is ignored by the runtime.
 
-### `SKILL.md` Format
+### `SKILL.md` format
 
-Each skill must use YAML frontmatter with `name` and `description`:
+Each skill needs YAML frontmatter with `name` and `description`:
 
 ```md
 ---
@@ -191,128 +259,94 @@ metadata:
 Use `pdfplumber`, `pypdf`, and rendered page checks when layout matters.
 ```
 
-### Slash Commands
+### How skills enter context
 
-- `/skill` lists discovered skills, whether they are part of the current session catalog, and whether they are pinned for the session
-- `/skill use <name>` pins a skill for the session
-- `/skill clear <name>` unpins one skill
-- `/skill clear all` unpins all session skills
-- `/skill show <name>` shows metadata, path, body size, and bundled resources
-- `/skill reload` rescans the skill directories from disk
+Nano-Coder separates:
 
-### Agent Behavior
+- **skill catalog**: skill name + short description
+- **skill body**: full `SKILL.md`
 
-- The system prompt contains a stable **skill catalog** for discovered skills in the current session:
-  - skill name
-  - short description
-- This includes repo-local and user-global skills after duplicate resolution
-- Full `SKILL.md` **skill bodies** are only loaded when:
-  - the agent calls the built-in `load_skill` tool during the current turn
-  - you explicitly preload a skill with `$skill-name`
-- Pinned skills from `/skill use <name>` stay available across turns, but their full bodies are injected later in the message list instead of being baked into the first system prompt
-- Loading a skill does not execute bundled scripts automatically
-- `scripts/`, `references/`, and `assets/` are inventoried as paths only; their contents are loaded only if the agent later reads them with tools
-- Set `SKILL_DEBUG=1` to print skill preload/load debug lines in the CLI while also recording structured `skill_event` entries in the session log
+The skill catalog is available up front. Full skill bodies are loaded on demand when:
 
-### Example Skill Session
+- the agent calls `load_skill`
+- you explicitly use `$skill-name`
+- a skill is pinned for the session with `/skill use <name>`
+
+Pinned skills remain available across turns, but their full bodies are injected later in the message list instead of being baked into the first system prompt.
+
+### Slash command and `$skill-name` behavior
+
+- Use `/skill` to inspect and manage discovered skills.
+- Use `$skill-name` in a prompt to preload that skill for the current turn.
+- Skill resources under `scripts/`, `references/`, and `assets/` are inventoried as paths only; their contents are not auto-loaded unless the agent reads them with tools.
+
+## MCP
+
+Nano-Coder can connect to MCP servers defined in `config.yaml`. Enabled servers are initialized at startup, and their tools are registered into the same tool system as built-in tools.
+
+Current example configuration includes DeepWiki:
+
+- `https://mcp.deepwiki.com/mcp`
+
+You can inspect loaded MCP servers and tools with:
 
 ```text
-You > $pdf explain this PDF form workflow
-
-Agent > Here is the PDF-specific workflow to follow...
+/mcp
+/mcp deepwiki
 ```
 
-## Usage
+## Logging
+
+Each CLI run writes a session directory under `logs/`:
+
+- `session.json` - session metadata and aggregate counts
+- `llm.log` - full human-readable execution timeline
+- `events.jsonl` - structured event stream
+- `artifacts/` - spilled large non-LLM payloads
+
+Convenience symlinks:
+
+- `logs/latest-session`
+- `logs/latest.log`
+
+### Reading logs
+
+- Start with `session.json` for a quick summary.
+- Open `llm.log` for the complete execution timeline.
+- Use `events.jsonl` when you want structured event records.
+- Check `artifacts/` only when an event or result references a spilled payload.
+
+## Secret Guardrail
+
+This repo includes git hooks that block commits and pushes when they contain values that look like real secrets.
+
+Enable them locally:
 
 ```bash
-# Run from the project root directory (either method works)
-python -m src.main
-# OR
-python src/main.py
+git config core.hooksPath .githooks
 ```
 
-## Testing
+Use `.env` for real credentials and keep tracked files on placeholders only.
 
-Run the test suite:
+## Development
+
+### Running tests
 
 ```bash
-# Install dev dependencies
 pip install -r requirements-dev.txt
-
-# Run all tests
 pytest
-
-# Run with coverage report
 pytest --cov=src --cov=tools --cov-report=html
-
-# Run specific test file
-pytest tests/test_tools.py -v
 ```
 
-Test files are located in the `tests/` directory following pytest conventions.
-
-## Project Structure
-
-```
-nano-coder/
-├── src/
-│   ├── main.py       # CLI entry point
-│   ├── agent.py      # Core agent orchestration
-│   ├── llm.py        # LLM API integration
-│   ├── tools.py      # Tool registry and base classes
-│   └── context.py    # Context management
-├── tools/
-│   ├── read.py       # File reading tool
-│   ├── write.py      # File writing tool
-│   └── bash.py       # Command execution tool
-└── tests/
-    └── test_tools.py
-```
-
-## Example Session
+### Key directories
 
 ```text
-You > list all python files
-
-Agent > I'll search for Python files in the current directory.
-  → run_command(command='find . -name "*.py" -type f')
-
-Found 3 Python files:
-- src/main.py
-- src/agent.py
-- src/tools.py
+src/                core CLI, agent, config, logging, skills, commands
+tools/              built-in tool implementations
+tests/              pytest suite
+.githooks/          local secret guard hooks
+.nano-coder/skills/ optional repo-local skills
 ```
-
-## Architecture
-
-Nano-Coder uses the **ReAct pattern** (Reasoning + Acting):
-
-1. User sends a message
-2. Agent sends message + tools to LLM
-3. If LLM requests tool calls, execute them
-4. Feed tool results back to LLM
-5. Repeat until no more tool calls
-6. Return final response to user
-
-## Available Tools
-
-| Tool | Description |
-| ---- | ----------- |
-| `read_file` | Read file contents with line numbers |
-| `write_file` | Create or overwrite files |
-| `run_command` | Execute shell commands |
-| `load_skill` | Load a skill's instructions and bundled resource inventory |
-
-## Next Steps
-
-Planned features for future releases:
-
-- [ ] Grep/Glob tools for code search
-- [ ] Edit tool for string replacement editing
-- [ ] Session persistence
-- [ ] Git integration
-- [ ] Permission system for safe operations
-- [ ] Todo tracking for multi-step tasks
 
 ## License
 

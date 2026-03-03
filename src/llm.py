@@ -458,7 +458,7 @@ class LLMClient:
         full_content = ""
         full_role = "assistant"
         accumulated_tool_calls = {}
-        first_content_token = True
+        first_token_marked = False
         final_finish_reason = None
         chunk_count = 0
 
@@ -478,9 +478,9 @@ class LLMClient:
                 full_content += delta.content
 
                 # Mark first token arrival
-                if first_content_token:
+                if not first_token_marked:
                     self._current_metrics.mark_first_token()
-                    first_content_token = False
+                    first_token_marked = True
 
                 # Record token timestamp
                 self._current_metrics.add_token_timestamp()
@@ -506,6 +506,14 @@ class LLMClient:
                             tc["name"] = tool_call_chunk.function.name
                         if tool_call_chunk.function.arguments:
                             tc["arguments"] += tool_call_chunk.function.arguments
+
+                # Mark first token arrival for tool calls (if not already marked)
+                if not first_token_marked:
+                    self._current_metrics.mark_first_token()
+                    first_token_marked = True
+
+                # Record token timestamp for each tool call chunk
+                self._current_metrics.add_token_timestamp()
 
             # Signal when complete
             if finish_reason:

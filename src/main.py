@@ -28,6 +28,7 @@ from src.skills import SkillManager
 from src.commands import CommandRegistry
 from src.commands import builtin
 from src.turn_display import TurnProgressDisplay
+from src.turn_controls import LiveTurnControls
 from src.subagents import SubagentManager
 
 REQUEST_TYPE_STREAMING = "streaming"
@@ -76,6 +77,26 @@ def _final_response_from_context(agent, fallback: str) -> str:
     return fallback
 
 
+def _calculate_aggregate_stream_tpot(metrics_list: list[LLMMetrics]) -> Optional[float]:
+    """Aggregate TPOT across streamed requests using existing per-request semantics."""
+    weighted_sum = 0.0
+    weight_total = 0
+
+    for metric in metrics_list:
+        if metric.request_type != REQUEST_TYPE_STREAMING:
+            continue
+        if metric.tpot <= 0 or metric.token_count < 2:
+            continue
+
+        token_intervals = metric.token_count - 1
+        weighted_sum += metric.tpot * token_intervals
+        weight_total += token_intervals
+
+    if weight_total == 0:
+        return None
+    return weighted_sum / weight_total
+
+
 def display_metrics(console: Console, metrics_list: list[LLMMetrics], request_type: str) -> None:
     """Display aggregate request metrics after the final answer."""
     if not metrics_list:
@@ -100,8 +121,9 @@ def display_metrics(console: Console, metrics_list: list[LLMMetrics], request_ty
         )
         if first_stream and first_stream.ttft > 0:
             parts.append(f"TTFT {first_stream.ttft:.2f}s")
-        if first_stream and first_stream.tpot > 0:
-            parts.append(f"TPOT {first_stream.tpot:.2f}s")
+        aggregate_stream_tpot = _calculate_aggregate_stream_tpot(metrics_list)
+        if aggregate_stream_tpot is not None:
+            parts.append(f"TPOT {aggregate_stream_tpot:.2f}s")
 
     if model and provider:
         parts.append(f"{model} ({provider})")
@@ -119,39 +141,38 @@ def run_agent_turn(
 ) -> str:
     """Run one agent turn with a live chronological activity feed."""
     request_type = REQUEST_TYPE_STREAMING if enable_streaming else REQUEST_TYPE_NON_STREAMING
-    display = TurnProgressDisplay(skill_debug=skill_debug, request_type=request_type)
+    display = TurnProgressDisplay(
+        skill_debug=skill_debug,
+        request_type=request_type,
+        live_activity_mode=config.ui.live_activity_mode,
+        live_activity_details=config.ui.live_activity_details,
+    )
+    live_controls = LiveTurnControls(display)
     response = ""
-
-    live_ref: list[Optional[Live]] = [None]
     animate_live = console.is_terminal
-
-    def refresh_live() -> None:
-        if live_ref[0] is not None:
-            live_ref[0].update(display.render_live(), refresh=True)
 
     def handle_event(event) -> None:
         display.handle_event(event)
-        refresh_live()
 
     try:
         with Live(
-            display.render_live(),
+            display,
             console=console,
             transient=False,
             auto_refresh=animate_live,
             refresh_per_second=12 if animate_live else 4,
         ) as live:
-            live_ref[0] = live
+            if animate_live:
+                live_controls.start()
             if enable_streaming:
                 for token in agent.run_stream(user_input, on_event=handle_event):
                     display.append_stream_chunk(token)
-                    refresh_live()
                 response = _final_response_from_context(agent, display.final_response_text())
             else:
                 response = agent.run(user_input, on_event=handle_event)
             live.update(display.render_persisted(), refresh=True)
     finally:
-        live_ref[0] = None
+        live_controls.stop()
 
     if response:
         console.print()

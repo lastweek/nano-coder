@@ -106,19 +106,17 @@ class _PreparedSubagentRun:
 
 
 class SubagentManager:
-    """Create and run local child agents with bounded parallel fan-out."""
+    """Create and run local child agents with per-turn-capped fan-out."""
 
     def __init__(
         self,
         *,
         enabled: Optional[bool] = None,
-        max_parallel: Optional[int] = None,
         max_per_turn: Optional[int] = None,
         default_timeout_seconds: Optional[int] = None,
     ) -> None:
         cfg = config.subagents
         self.enabled = enabled if enabled is not None else cfg.enabled
-        self.max_parallel = max_parallel if max_parallel is not None else cfg.max_parallel
         self.max_per_turn = max_per_turn if max_per_turn is not None else cfg.max_per_turn
         self.default_timeout_seconds = (
             default_timeout_seconds
@@ -353,7 +351,7 @@ class SubagentManager:
         results_by_id: dict[str, SubagentResult] = {}
         future_map: dict[object, tuple[_PreparedSubagentRun, float]] = {}
 
-        max_workers = min(self.max_parallel, max(len(prepared_subagent_runs), 1))
+        max_workers = max(len(prepared_subagent_runs), 1)
         with ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="subagent",
@@ -365,6 +363,7 @@ class SubagentManager:
                     parent_agent,
                     prepared_subagent_run,
                     parent_turn_id,
+                    on_event,
                 )
                 future_map[future] = (prepared_subagent_run, started_at)
 
@@ -406,6 +405,7 @@ class SubagentManager:
         parent_agent,
         prepared_subagent_run: _PreparedSubagentRun,
         parent_turn_id: int | None,
+        on_event,
     ) -> SubagentResult:
         """Build the child runtime inside the worker thread and return its result."""
         child_logger: SessionLogger | None = None
@@ -420,7 +420,14 @@ class SubagentManager:
                 parent_turn_id=parent_turn_id,
             )
             child_agent = self._create_child_agent(parent_agent, child_context, child_logger)
-            report = child_agent.run(prepared_subagent_run.task_message)
+            report = child_agent.run(
+                prepared_subagent_run.task_message,
+                on_event=lambda event: self._forward_subagent_event(
+                    event,
+                    prepared_subagent_run,
+                    on_event,
+                ),
+            )
         except Exception as exc:
             snapshot = self._close_child_logger(
                 child_logger,
@@ -442,6 +449,29 @@ class SubagentManager:
             status="completed",
             summary=self._extract_summary(report),
             report=report,
+        )
+
+    def _forward_subagent_event(
+        self,
+        event: TurnActivityEvent,
+        prepared_subagent_run: _PreparedSubagentRun,
+        on_event,
+    ) -> None:
+        """Forward child activity into the parent turn stream with child worker metadata."""
+        if on_event is None:
+            return
+
+        on_event(
+            TurnActivityEvent(
+                kind=event.kind,
+                iteration=event.iteration,
+                worker_id=prepared_subagent_run.run.subagent_id,
+                worker_label=prepared_subagent_run.run.label,
+                worker_kind="subagent",
+                parent_worker_id="main",
+                timestamp=event.timestamp,
+                details=dict(event.details),
+            )
         )
 
     def _close_child_logger(

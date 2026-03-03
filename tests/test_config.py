@@ -42,13 +42,14 @@ class TestConfigDefaults:
         config = Config()
         assert config.ui.enable_streaming is True
         assert config.ui.loading_indicator_interval == 0.8
+        assert config.ui.live_activity_mode == "simple"
+        assert config.ui.live_activity_details == "collapsed"
 
     def test_subagent_defaults(self, monkeypatch):
         """Test subagent config default values."""
         monkeypatch.delenv("SUBAGENTS_ENABLED", raising=False)
         config = Config()
         assert config.subagents.enabled is True
-        assert config.subagents.max_parallel == 3
         assert config.subagents.max_per_turn == 6
         assert config.subagents.default_timeout_seconds == 180
 
@@ -152,6 +153,14 @@ class TestConfigEnvOverrides:
         monkeypatch.setenv("ENABLE_STREAMING", "false")
         config = Config()
         assert config.ui.enable_streaming is False
+
+    def test_live_activity_env_overrides(self, monkeypatch):
+        """Test live activity defaults can be overridden via environment."""
+        monkeypatch.setenv("LIVE_ACTIVITY_MODE", "verbose")
+        monkeypatch.setenv("LIVE_ACTIVITY_DETAILS", "expanded")
+        config = Config()
+        assert config.ui.live_activity_mode == "verbose"
+        assert config.ui.live_activity_details == "expanded"
 
     def test_enable_logging_env_override(self, monkeypatch):
         """Test ENABLE_LOGGING env variable override."""

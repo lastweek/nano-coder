@@ -1,6 +1,6 @@
 """Centralized configuration for Nano-Coder."""
 
-from typing import Optional, List
+from typing import Optional, List, Literal
 from pathlib import Path
 import yaml
 from pydantic import Field, field_validator
@@ -75,6 +75,8 @@ class UIConfig(BaseSettings):
 
     enable_streaming: bool = Field(default=True)
     loading_indicator_interval: float = Field(default=0.8, gt=0)
+    live_activity_mode: Literal["simple", "verbose"] = Field(default="simple")
+    live_activity_details: Literal["collapsed", "expanded"] = Field(default="collapsed")
 
 
 class ContextConfig(BaseSettings):
@@ -122,7 +124,6 @@ class SubagentConfig(BaseSettings):
     )
 
     enabled: bool = Field(default=True)
-    max_parallel: int = Field(default=3, ge=1)
     max_per_turn: int = Field(default=6, ge=1)
     default_timeout_seconds: int = Field(default=180, ge=1)
 

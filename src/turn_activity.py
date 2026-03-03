@@ -47,10 +47,11 @@ class TurnActivityEvent:
     - `llm_call_started`: `stream`, `message_count`, `tool_schema_count`
     - `llm_call_finished`: `stream`, `duration_s`, `prompt_tokens`,
       `completion_tokens`, `total_tokens`, `cached_tokens`, `has_tool_calls`,
-      `tool_call_count`, `result_kind`
+      `tool_call_count`, `result_kind`, `assistant_preview`,
+      `assistant_body`, `requested_tool_signatures`
     - `tool_call_started`: `tool_name`, `tool_call_id`, `arguments`
     - `tool_call_finished`: `tool_name`, `tool_call_id`, `arguments`, `success`,
-      `duration_s`, optional `error`
+      `duration_s`, optional `error`, `result_preview`, `result_body`
     - `subagent_started`: `subagent_id`, `label`, `task`
     - `subagent_completed`: `subagent_id`, `label`, `duration_s`, `summary`
     - `subagent_failed`: `subagent_id`, `label`, `duration_s`, `error`
@@ -61,6 +62,10 @@ class TurnActivityEvent:
 
     kind: TurnActivityKind
     iteration: Optional[int] = None
+    worker_id: str = "main"
+    worker_label: str = "Main Agent"
+    worker_kind: Literal["main", "subagent"] = "main"
+    parent_worker_id: str | None = None
     timestamp: float = field(default_factory=perf_counter)
     details: dict[str, Any] = field(default_factory=dict)
 

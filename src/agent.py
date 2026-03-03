@@ -4,6 +4,11 @@ from dataclasses import dataclass
 import json
 from time import perf_counter
 from typing import Callable, Optional, List, Dict, Tuple, Any, Literal
+from src.activity_preview import (
+    build_assistant_preview,
+    build_tool_result_preview,
+    build_tool_signature,
+)
 from src.tools import (
     ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL,
     REQUEST_KIND_AGENT_TURN,
@@ -255,8 +260,14 @@ Be concise and helpful."""
         stream: bool,
         metrics: Any,
         tool_calls: List[Dict[str, Any]],
+        assistant_text: str,
     ) -> None:
         """Emit the live event for a completed LLM request."""
+        requested_tool_signatures = self._build_requested_tool_signatures(tool_calls)
+        assistant_preview, assistant_body = build_assistant_preview(
+            assistant_text,
+            requested_tool_signatures,
+        )
         self._emit_turn_event(
             on_event,
             "llm_call_finished",
@@ -266,7 +277,18 @@ Be concise and helpful."""
             has_tool_calls=bool(tool_calls),
             tool_call_count=len(tool_calls),
             result_kind="tool_calls" if tool_calls else "final_answer",
+            assistant_preview=assistant_preview,
+            assistant_body=assistant_body,
+            requested_tool_signatures=requested_tool_signatures,
         )
+
+    def _build_requested_tool_signatures(self, tool_calls: List[Dict[str, Any]]) -> List[str]:
+        """Render compact signatures for a model-issued tool-call batch."""
+        signatures: List[str] = []
+        for tool_call in tool_calls:
+            arguments = self._parse_tool_arguments_for_logging(tool_call.get("arguments", "{}"))
+            signatures.append(build_tool_signature(tool_call.get("name"), arguments))
+        return signatures
 
     def _store_recent_prompt_metrics(self, metrics: Any) -> None:
         """Persist the most recent prompt usage for compaction decisions."""
@@ -565,7 +587,7 @@ Be concise and helpful."""
         on_event: Optional[TurnActivityCallback],
         tools_used: Optional[List[str]],
     ) -> int:
-        """Process one consecutive run_subagent batch with bounded parallel fan-out."""
+        """Process one consecutive run_subagent batch with per-turn-capped fan-out."""
         resolved_tool_calls: List[_SubagentToolCallResolution] = []
 
         for tool_call in tool_calls:
@@ -761,6 +783,7 @@ Be concise and helpful."""
                 result=result_content,
                 tool_call_id=tool_call_id,
             )
+            result_preview, result_body = build_tool_result_preview(tool_name, result_content)
             self._emit_turn_event(
                 on_event,
                 "tool_call_finished",
@@ -771,6 +794,8 @@ Be concise and helpful."""
                 success="error" not in result_content,
                 duration_s=duration_s,
                 error=result_content.get("error"),
+                result_preview=result_preview,
+                result_body=result_body,
             )
             if tool_name == "load_skill":
                 skill_event_name = "tool_load_succeeded"
@@ -986,6 +1011,7 @@ Be concise and helpful."""
             stream=False,
             metrics=metrics,
             tool_calls=tool_calls,
+            assistant_text=response.get("content", ""),
         )
         if not tool_calls:
             return _ModelIterationResult(
@@ -1042,6 +1068,7 @@ Be concise and helpful."""
             stream=True,
             metrics=metrics_for_event,
             tool_calls=tool_calls,
+            assistant_text="".join(streamed_text_chunks),
         )
 
         if not tool_calls:

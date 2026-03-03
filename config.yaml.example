@@ -20,6 +20,8 @@ agent:
 ui:
   enable_streaming: true
   loading_indicator_interval: 0.8
+  live_activity_mode: simple
+  live_activity_details: collapsed
 
 context:
   auto_compact: true
@@ -29,7 +31,6 @@ context:
 
 subagents:
   enabled: true
-  max_parallel: 3
   max_per_turn: 6
   default_timeout_seconds: 180
 

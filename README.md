@@ -10,7 +10,7 @@ The project is built for practical repo work: you get a live activity feed while
 - Tool-based code tasks with `read_file`, `write_file`, and `run_command`
 - Streaming answers plus a live activity feed while the agent is thinking
 - MCP support for external tool servers such as DeepWiki
-- Local subagents for bounded parallel delegated repo tasks
+- Local subagents for delegated repo tasks with a per-turn cap
 - Local skill system with cataloging, pinning, and on-demand loading
 - Per-session logging with `session.json`, `llm.log`, and `events.jsonl`
 - `/context` command for estimating next-call baseline context usage

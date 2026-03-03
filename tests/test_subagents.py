@@ -192,7 +192,7 @@ def test_run_subagents_executes_multiple_real_children_in_input_order(monkeypatc
     context = Context.create(cwd=str(temp_dir))
     skill_manager = SkillManager(repo_root=Path(temp_dir))
     skill_manager.discover()
-    subagent_manager = SubagentManager(max_parallel=2)
+    subagent_manager = SubagentManager()
     tools = build_tool_registry(
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
@@ -238,12 +238,13 @@ def test_run_subagents_executes_multiple_real_children_in_input_order(monkeypatc
     assert [result.status for result in results] == ["completed", "completed"]
     assert len(subagent_manager.list_runs()) == 2
     assert all(Path(result.session_dir).exists() for result in results)
-    assert [event.kind for event in events] == [
-        "subagent_started",
-        "subagent_started",
-        "subagent_completed",
-        "subagent_completed",
-    ]
+    assert [event.kind for event in events[:2]] == ["subagent_started", "subagent_started"]
+    forwarded_events = [event for event in events if event.worker_kind == "subagent"]
+    assert {event.worker_label for event in forwarded_events} == {"slow-one", "fast-two"}
+    assert [event.kind for event in forwarded_events].count("llm_call_started") == 2
+    assert [event.kind for event in forwarded_events].count("llm_call_finished") == 2
+    assert [event.kind for event in forwarded_events].count("turn_completed") == 2
+    assert [event.kind for event in events].count("subagent_completed") == 2
 
 
 def test_run_subagents_rejects_empty_request_list(temp_dir):
@@ -368,6 +369,65 @@ def test_single_subagent_run_uses_thread_pool(monkeypatch, temp_dir):
     assert any(call[0] == "submit" for call in submit_calls)
 
 
+def test_run_subagents_uses_one_worker_per_accepted_request(monkeypatch, temp_dir):
+    """Accepted subagents should all be submitted in one executor batch."""
+    monkeypatch.setattr("src.subagents.LLMClient", FakeChildLLM)
+
+    submit_calls = []
+
+    class TrackingExecutor:
+        def __init__(self, *, max_workers, thread_name_prefix):
+            submit_calls.append(("init", max_workers, thread_name_prefix))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            submit_calls.append(("submit", len(args)))
+            future = Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+    monkeypatch.setattr("src.subagents.ThreadPoolExecutor", TrackingExecutor)
+
+    context = Context.create(cwd=str(temp_dir))
+    skill_manager = SkillManager(repo_root=Path(temp_dir))
+    skill_manager.discover()
+    subagent_manager = SubagentManager(max_per_turn=6)
+    tools = build_tool_registry(
+        skill_manager=skill_manager,
+        subagent_manager=subagent_manager,
+        include_subagent_tool=True,
+    )
+    parent_logger = SessionLogger(context.session_id, log_dir=str(temp_dir), enabled=True)
+    parent_agent = Agent(
+        DummyParentLLM(),
+        tools,
+        context,
+        skill_manager=skill_manager,
+        logger=parent_logger,
+        subagent_manager=subagent_manager,
+    )
+
+    results = subagent_manager.run_subagents(
+        parent_agent,
+        [
+            SubagentRequest("a", "one", "", "", [], ""),
+            SubagentRequest("b", "two", "", "", [], ""),
+            SubagentRequest("c", "three", "", "", [], ""),
+        ],
+        parent_turn_id=1,
+    )
+    parent_agent.logger.close()
+
+    assert [result.status for result in results] == ["completed", "completed", "completed"]
+    assert ("init", 3, "subagent") in submit_calls
+    assert sum(1 for call in submit_calls if call[0] == "submit") == 3
+
+
 def test_run_subagents_rejects_overflow_requests_and_preserves_order(monkeypatch, temp_dir):
     """Requests beyond max_per_turn should be rejected after allowed requests keep their order."""
     monkeypatch.setattr("src.subagents.LLMClient", FakeChildLLM)
@@ -375,7 +435,7 @@ def test_run_subagents_rejects_overflow_requests_and_preserves_order(monkeypatch
     context = Context.create(cwd=str(temp_dir))
     skill_manager = SkillManager(repo_root=Path(temp_dir))
     skill_manager.discover()
-    subagent_manager = SubagentManager(max_per_turn=2, max_parallel=2)
+    subagent_manager = SubagentManager(max_per_turn=2)
     tools = build_tool_registry(
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
@@ -415,7 +475,7 @@ def test_run_subagents_enforces_per_turn_capacity_across_multiple_calls(monkeypa
     context = Context.create(cwd=str(temp_dir))
     skill_manager = SkillManager(repo_root=Path(temp_dir))
     skill_manager.discover()
-    subagent_manager = SubagentManager(max_per_turn=2, max_parallel=2)
+    subagent_manager = SubagentManager(max_per_turn=2)
     tools = build_tool_registry(
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
@@ -473,7 +533,7 @@ def test_run_subagents_returns_timed_out_result(temp_dir, monkeypatch):
         subagent_manager=subagent_manager,
     )
 
-    def slow_run_subagent_in_thread(parent_agent, prepared_subagent_run, parent_turn_id):
+    def slow_run_subagent_in_thread(parent_agent, prepared_subagent_run, parent_turn_id, on_event):
         time.sleep(0.05)
         return SubagentResult(
             subagent_id=prepared_subagent_run.run.subagent_id,

@@ -22,6 +22,39 @@ def normalize_output(output: str) -> str:
     return "\n".join(line.rstrip() for line in output.splitlines())
 
 
+def make_metrics(
+    *,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    duration: float = 0.0,
+    ttft: float = 0.0,
+    token_count: int = 0,
+    tpot: float = 0.0,
+    request_type: str = "",
+    model: str = "glm-5",
+    provider: str = "custom",
+):
+    """Create LLMMetrics with deterministic derived duration and TPOT."""
+    from src.metrics import LLMMetrics
+
+    metrics = LLMMetrics(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        model=model,
+        provider=provider,
+        request_type=request_type,
+        ttft=ttft,
+        token_count=token_count,
+    )
+    metrics.start_time = 100.0
+    metrics.end_time = 100.0 + duration
+    if token_count >= 2 and tpot > 0:
+        metrics.first_token_time = 101.0
+        metrics.last_token_time = metrics.first_token_time + (tpot * (token_count - 1))
+    return metrics
+
+
 def test_print_banner_no_error():
     """Test that print_banner runs without errors."""
     from src.main import print_banner
@@ -74,6 +107,134 @@ def test_print_banner_minimal_config(monkeypatch):
     console = Console()
     # Should not raise any exceptions even with minimal config
     print_banner(console)
+
+
+def test_display_metrics_streaming_single_call_shows_ttft_and_tpot():
+    """Single streaming calls should continue showing both TTFT and TPOT."""
+    from src.main import display_metrics, REQUEST_TYPE_STREAMING
+
+    console = make_recording_console()
+    metrics_list = [
+        make_metrics(
+            prompt_tokens=120,
+            completion_tokens=10,
+            duration=5.5,
+            ttft=1.2,
+            token_count=5,
+            tpot=0.4,
+            request_type=REQUEST_TYPE_STREAMING,
+        )
+    ]
+
+    display_metrics(console, metrics_list, REQUEST_TYPE_STREAMING)
+    normalized = normalize_output(console.export_text())
+
+    assert "120 prompt tokens" in normalized
+    assert "10 completion tokens" in normalized
+    assert "5.50s" in normalized
+    assert "TTFT 1.20s" in normalized
+    assert "TPOT 0.40s" in normalized
+    assert "glm-5 (custom)" in normalized
+
+
+def test_display_metrics_streaming_uses_first_stream_ttft_and_aggregate_tpot():
+    """Multi-call streaming turns should keep first-stream TTFT but aggregate TPOT."""
+    from src.main import display_metrics, REQUEST_TYPE_NON_STREAMING, REQUEST_TYPE_STREAMING
+
+    console = make_recording_console()
+    metrics_list = [
+        make_metrics(
+            prompt_tokens=100,
+            completion_tokens=5,
+            duration=10.0,
+            ttft=2.5,
+            token_count=1,
+            tpot=0.0,
+            request_type=REQUEST_TYPE_STREAMING,
+        ),
+        make_metrics(
+            prompt_tokens=50,
+            completion_tokens=20,
+            duration=15.0,
+            ttft=0.9,
+            token_count=6,
+            tpot=0.3,
+            request_type=REQUEST_TYPE_STREAMING,
+        ),
+        make_metrics(
+            prompt_tokens=30,
+            completion_tokens=7,
+            duration=4.0,
+            request_type=REQUEST_TYPE_NON_STREAMING,
+        ),
+    ]
+
+    display_metrics(console, metrics_list, REQUEST_TYPE_STREAMING)
+    normalized = normalize_output(console.export_text())
+
+    assert "180 prompt tokens" in normalized
+    assert "32 completion tokens" in normalized
+    assert "29.00s" in normalized
+    assert "TTFT 2.50s" in normalized
+    assert "TPOT 0.30s" in normalized
+    assert "TPOT 0.00s" not in normalized
+
+
+def test_display_metrics_streaming_omits_tpot_without_valid_stream_contributors():
+    """Streaming turns should omit TPOT when no streamed request has usable output timing."""
+    from src.main import display_metrics, REQUEST_TYPE_STREAMING
+
+    console = make_recording_console()
+    metrics_list = [
+        make_metrics(
+            prompt_tokens=40,
+            completion_tokens=3,
+            duration=3.0,
+            ttft=0.8,
+            token_count=1,
+            tpot=0.0,
+            request_type=REQUEST_TYPE_STREAMING,
+        ),
+        make_metrics(
+            prompt_tokens=20,
+            completion_tokens=0,
+            duration=1.0,
+            ttft=0.0,
+            token_count=0,
+            tpot=0.0,
+            request_type=REQUEST_TYPE_STREAMING,
+        ),
+    ]
+
+    display_metrics(console, metrics_list, REQUEST_TYPE_STREAMING)
+    normalized = normalize_output(console.export_text())
+
+    assert "TTFT 0.80s" in normalized
+    assert "TPOT" not in normalized
+
+
+def test_display_metrics_non_streaming_omits_ttft_and_tpot():
+    """Non-streaming summaries should keep omitting TTFT and TPOT."""
+    from src.main import display_metrics, REQUEST_TYPE_NON_STREAMING
+
+    console = make_recording_console()
+    metrics_list = [
+        make_metrics(
+            prompt_tokens=75,
+            completion_tokens=9,
+            duration=8.25,
+            request_type=REQUEST_TYPE_NON_STREAMING,
+        )
+    ]
+
+    display_metrics(console, metrics_list, REQUEST_TYPE_NON_STREAMING)
+    normalized = normalize_output(console.export_text())
+
+    assert "75 prompt tokens" in normalized
+    assert "9 completion tokens" in normalized
+    assert "8.25s" in normalized
+    assert "TTFT" not in normalized
+    assert "TPOT" not in normalized
 
 
 class StubContext:

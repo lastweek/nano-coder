@@ -128,6 +128,22 @@ class SubagentConfig(BaseSettings):
     default_timeout_seconds: int = Field(default=180, ge=1)
 
 
+class PlanConfig(BaseSettings):
+    """Planning workflow configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="PLAN_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=True)
+    plan_dir: str = Field(default=".nano-coder/plans")
+    allow_subagents: bool = Field(default=True)
+
+
 class MCPServerConfig(BaseSettings):
     """Configuration for a single MCP server."""
 
@@ -187,6 +203,7 @@ class Config:
         self.ui = self._create_config(UIConfig, config_dict.get("ui", {}))
         self.context = self._create_config(ContextConfig, config_dict.get("context", {}))
         self.subagents = self._create_config(SubagentConfig, config_dict.get("subagents", {}))
+        self.plan = self._create_config(PlanConfig, config_dict.get("plan", {}))
         self.mcp = self._create_mcp_config(config_dict.get("mcp", {}))
 
         if self.context.target_usage_after_compaction >= self.context.auto_compact_threshold:

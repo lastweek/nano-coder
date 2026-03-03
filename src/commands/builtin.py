@@ -1,6 +1,7 @@
 """Built-in slash commands."""
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
@@ -12,7 +13,15 @@ from src.commands.registry import (
     render_command_help,
     render_unknown_subcommand,
 )
+from src.config import config
 from src.context_usage import build_context_usage_snapshot, format_token_count
+from src.plan_mode import (
+    build_plan_execution_message,
+    create_session_plan,
+    mark_plan_approved,
+    mark_plan_executing,
+    mark_plan_rejected,
+)
 
 
 def _get_skill_dependencies(console: Console, context: Any):
@@ -92,6 +101,33 @@ def _get_subagent_dependencies(console: Console, context: Any):
         console.print("[red]Agent and subagent manager are required for /subagent[/red]")
         return None, None
     return agent, subagent_manager
+
+
+def _get_plan_dependencies(console: Console, context: Any):
+    """Get plan-workflow dependencies from command context."""
+    agent = context.get("agent")
+    session_context = context.get("session_context")
+    run_agent_turn = context.get("run_agent_turn_callback")
+    set_tool_profile = context.get("set_tool_profile_callback")
+    if agent is None or session_context is None or run_agent_turn is None or set_tool_profile is None:
+        console.print("[red]Agent, session context, and plan callbacks are required for /plan[/red]")
+        return None, None, None, None
+    return agent, session_context, run_agent_turn, set_tool_profile
+
+
+def _prompt_for_plan_decision(console: Console, context: Any) -> Optional[bool]:
+    """Prompt for plan approval when an interactive input callback is available."""
+    prompt_input = context.get("prompt_input_callback")
+    if prompt_input is None or not console.is_terminal:
+        return None
+
+    while True:
+        decision = prompt_input("\nPlan Review [accept/reject] > ").strip().lower()
+        if decision in {"accept", "a", "yes", "y"}:
+            return True
+        if decision in {"reject", "r", "no", "n"}:
+            return False
+        console.print("[yellow]Please enter accept or reject[/yellow]")
 
 
 def register_all(registry):
@@ -187,6 +223,61 @@ def register_all(registry):
                 usage="/subagent show <id>",
                 description="Show the stored metadata and report for one prior subagent run.",
                 examples=["/subagent show sa_0001_abcd1234"],
+            ),
+        ],
+    )
+
+    plan_help_spec = CommandHelpSpec(
+        summary="Start, inspect, approve, or clear the session-local planning workflow.",
+        usage=[
+            "/plan",
+            "/plan start <task>",
+            "/plan show",
+            "/plan apply",
+            "/plan exit",
+            "/plan clear",
+        ],
+        examples=[
+            "/plan",
+            "/plan start add a safe plan mode to the CLI",
+            "/plan show",
+            "/plan apply",
+        ],
+        notes=[
+            "/plan start enters planning mode and runs a planning turn immediately.",
+            "Accepting a submitted plan switches back to build mode and executes it immediately.",
+            "Rejecting a submitted plan returns to build mode but keeps the plan file on disk.",
+        ],
+        subcommands=[
+            CommandSubcommandHelp(
+                name="start",
+                usage="/plan start <task>",
+                description="Enter planning mode, create or reuse the canonical session plan file, and run a planning turn.",
+                examples=["/plan start redesign the context command and list test coverage"],
+            ),
+            CommandSubcommandHelp(
+                name="show",
+                usage="/plan show",
+                description="Show the current session plan metadata and persisted plan content.",
+                examples=["/plan show"],
+            ),
+            CommandSubcommandHelp(
+                name="apply",
+                usage="/plan apply",
+                description="Apply the current reviewed or approved plan and execute it in build mode.",
+                examples=["/plan apply"],
+            ),
+            CommandSubcommandHelp(
+                name="exit",
+                usage="/plan exit",
+                description="Leave planning mode and return to build mode without executing the current plan.",
+                examples=["/plan exit"],
+            ),
+            CommandSubcommandHelp(
+                name="clear",
+                usage="/plan clear",
+                description="Clear the active approved plan contract while leaving the plan artifact on disk.",
+                examples=["/plan clear"],
             ),
         ],
     )
@@ -511,6 +602,244 @@ def register_all(registry):
             return
 
         console.print(f"[red]Unknown /subagent subcommand: {subcommand}[/red]")
+
+    @registry.register(
+        "plan",
+        "Start, inspect, or apply the session-local planning workflow",
+        args_description="[start <task>|show|apply|exit|clear]",
+        short_desc="Manage the planning workflow",
+        help_spec=plan_help_spec,
+    )
+    def cmd_plan(console: Console, args: str, context: Any):
+        """Start, inspect, or apply the session-local planning workflow."""
+        agent, session_context, run_agent_turn_callback, set_tool_profile_callback = _get_plan_dependencies(console, context)
+        if (
+            agent is None
+            or session_context is None
+            or run_agent_turn_callback is None
+            or set_tool_profile_callback is None
+        ):
+            return
+
+        if not config.plan.enabled:
+            console.print("[yellow]Plan mode is disabled in the current configuration[/yellow]")
+            return
+
+        raw_args = args.strip()
+        command = registry.get_command("plan")
+        current_plan = session_context.get_current_plan()
+
+        if not raw_args:
+            active_plan = session_context.get_active_approved_plan()
+            status_lines = [
+                f"[bold]Mode:[/bold] {session_context.get_session_mode()}",
+                f"[bold]Plan present:[/bold] {'yes' if current_plan is not None else 'no'}",
+                f"[bold]Active contract:[/bold] {'yes' if active_plan is not None else 'no'}",
+            ]
+            if current_plan is not None:
+                status_lines.extend(
+                    [
+                        f"[bold]Plan ID:[/bold] {current_plan.plan_id}",
+                        f"[bold]Status:[/bold] {current_plan.status}",
+                        f"[bold]Path:[/bold] {current_plan.file_path}",
+                        f"[bold]Task:[/bold] {current_plan.task}",
+                    ]
+                )
+            console.print(Panel("\n".join(status_lines), title="Plan Status", border_style="cyan"))
+            return
+
+        parts = raw_args.split(maxsplit=1)
+        subcommand = parts[0].lower()
+        remainder = parts[1].strip() if len(parts) > 1 else ""
+
+        if subcommand == "start":
+            if not remainder:
+                console.print("[yellow]Missing task for /plan start[/yellow]")
+                if command is not None:
+                    render_command_help(console, command, "start")
+                return
+
+            session_context.set_session_mode("plan")
+            plan = create_session_plan(
+                session_context,
+                task=remainder,
+                plan_dir=config.plan.plan_dir,
+            )
+            set_tool_profile_callback("plan_main")
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.log_plan_event(
+                    turn_id=None,
+                    stage="started",
+                    plan_id=plan.plan_id,
+                    status=plan.status,
+                    file_path=plan.file_path,
+                    task=plan.task,
+                )
+
+            console.print(Panel(
+                f"[bold]Planning task:[/bold] {plan.task}\n[bold]Plan file:[/bold] {plan.file_path}",
+                title="Planning Mode",
+                border_style="cyan",
+            ))
+            run_agent_turn_callback(plan.task)
+
+            submitted_plan = session_context.get_current_plan()
+            if submitted_plan is None:
+                console.print("[yellow]Planning finished without creating a plan artifact[/yellow]")
+                session_context.set_session_mode("build")
+                set_tool_profile_callback("build")
+                return
+
+            if submitted_plan.status != "ready_for_review":
+                console.print(
+                    "[yellow]Planning finished without submit_plan. "
+                    "Review the plan draft with /plan show or continue planning.[/yellow]"
+                )
+                return
+
+            if submitted_plan.report:
+                console.print()
+                console.print(Panel(Markdown(submitted_plan.report), title="Plan Review", border_style="cyan"))
+
+            decision = _prompt_for_plan_decision(console, context)
+            if decision is None:
+                session_context.set_session_mode("build")
+                set_tool_profile_callback("build")
+                console.print(
+                    "[yellow]Plan ready for review. Use /plan apply to execute it or /plan exit to leave planning mode.[/yellow]"
+                )
+                return
+
+            if decision:
+                approved_plan = mark_plan_approved(session_context)
+                session_context.set_session_mode("build")
+                set_tool_profile_callback("build")
+                if logger is not None:
+                    logger.log_plan_event(
+                        turn_id=None,
+                        stage="approved",
+                        plan_id=approved_plan.plan_id,
+                        status=approved_plan.status,
+                        file_path=approved_plan.file_path,
+                    )
+                executing_plan = mark_plan_executing(session_context)
+                if logger is not None:
+                    logger.log_plan_event(
+                        turn_id=None,
+                        stage="execution_started",
+                        plan_id=executing_plan.plan_id,
+                        status=executing_plan.status,
+                        file_path=executing_plan.file_path,
+                    )
+                console.print("[green]Plan accepted. Executing the approved plan.[/green]")
+                run_agent_turn_callback(build_plan_execution_message(executing_plan))
+                return
+
+            rejected_plan = mark_plan_rejected(session_context)
+            session_context.set_session_mode("build")
+            set_tool_profile_callback("build")
+            if logger is not None:
+                logger.log_plan_event(
+                    turn_id=None,
+                    stage="rejected",
+                    plan_id=rejected_plan.plan_id,
+                    status=rejected_plan.status,
+                    file_path=rejected_plan.file_path,
+                )
+            console.print("[yellow]Plan rejected. Returned to build mode.[/yellow]")
+            return
+
+        if subcommand == "show":
+            if current_plan is None:
+                console.print("[yellow]No session plan exists yet[/yellow]")
+                return
+
+            metadata = "\n".join(
+                [
+                    f"[bold]Plan ID:[/bold] {current_plan.plan_id}",
+                    f"[bold]Status:[/bold] {current_plan.status}",
+                    f"[bold]Task:[/bold] {current_plan.task}",
+                    f"[bold]Path:[/bold] {current_plan.file_path}",
+                    f"[bold]Approved:[/bold] {current_plan.approved_at or '-'}",
+                ]
+            )
+            console.print(Panel(metadata, title="Session Plan", border_style="cyan"))
+            if current_plan.summary:
+                console.print(f"[bold]Summary:[/bold] {current_plan.summary}")
+            if current_plan.content:
+                console.print(Markdown(current_plan.content))
+            else:
+                console.print("[yellow]Plan file is currently empty[/yellow]")
+            return
+
+        if subcommand == "apply":
+            if current_plan is None:
+                console.print("[yellow]No session plan exists yet[/yellow]")
+                return
+            if current_plan.status not in {"ready_for_review", "approved", "executing"}:
+                console.print(
+                    f"[yellow]Current plan status '{current_plan.status}' cannot be applied[/yellow]"
+                )
+                return
+
+            approved_plan = current_plan
+            logger = getattr(agent, "logger", None)
+            if session_context.active_approved_plan_id != current_plan.plan_id:
+                approved_plan = mark_plan_approved(session_context)
+                if logger is not None:
+                    logger.log_plan_event(
+                        turn_id=None,
+                        stage="approved",
+                        plan_id=approved_plan.plan_id,
+                        status=approved_plan.status,
+                        file_path=approved_plan.file_path,
+                    )
+
+            executing_plan = mark_plan_executing(session_context)
+            session_context.set_session_mode("build")
+            set_tool_profile_callback("build")
+            if logger is not None:
+                logger.log_plan_event(
+                    turn_id=None,
+                    stage="execution_started",
+                    plan_id=executing_plan.plan_id,
+                    status=executing_plan.status,
+                    file_path=executing_plan.file_path,
+                )
+            console.print("[green]Executing the approved session plan.[/green]")
+            run_agent_turn_callback(build_plan_execution_message(executing_plan))
+            return
+
+        if subcommand == "exit":
+            session_context.set_session_mode("build")
+            set_tool_profile_callback("build")
+            console.print("[yellow]Returned to build mode.[/yellow]")
+            return
+
+        if subcommand == "clear":
+            if current_plan is None or session_context.active_approved_plan_id is None:
+                console.print("[yellow]No active approved plan contract to clear[/yellow]")
+                return
+            cleared_plan_id = session_context.active_approved_plan_id
+            session_context.clear_active_plan_contract()
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.log_plan_event(
+                    turn_id=None,
+                    stage="cleared",
+                    plan_id=cleared_plan_id,
+                    status=current_plan.status,
+                    file_path=current_plan.file_path,
+                )
+            console.print("[yellow]Cleared the active approved plan contract for this session.[/yellow]")
+            return
+
+        if command is not None:
+            render_unknown_subcommand(console, command, subcommand)
+            return
+
+        console.print(f"[red]Unknown /plan subcommand: {subcommand}[/red]")
 
     @registry.register(
         "compact",

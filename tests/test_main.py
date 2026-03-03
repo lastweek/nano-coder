@@ -57,11 +57,14 @@ def make_metrics(
 
 def test_print_banner_no_error():
     """Test that print_banner runs without errors."""
-    from src.main import print_banner
+    from src.main import NANO_CODER_WORDMARK, print_banner
 
-    console = Console()
-    # Should not raise any exceptions
+    console = make_recording_console()
     print_banner(console)
+
+    rendered = normalize_output(console.export_text())
+    assert NANO_CODER_WORDMARK.splitlines()[0] in rendered
+    assert "Minimalism Terminal Code Agent" in rendered
 
 
 def test_print_banner_with_context_window(monkeypatch):

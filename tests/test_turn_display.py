@@ -2,6 +2,7 @@
 
 from rich.console import Console
 
+from src.context import Context
 from src.turn_activity import TurnActivityEvent
 from src.turn_display import TurnProgressDisplay
 
@@ -188,3 +189,17 @@ def test_persisted_summary_remains_concise():
     assert "LLM call 1 requested 1 tool" in rendered
     assert "Main Agent" not in rendered
     assert "assistant response" not in rendered
+
+
+def test_render_live_includes_statusline_footer():
+    """Live rendering should include the shared statusline footer when session context is available."""
+    context = Context.create()
+    display = TurnProgressDisplay(
+        session_context=context,
+        live_activity_mode="verbose",
+        live_activity_details="collapsed",
+    )
+
+    rendered = render_text(display.render_live())
+
+    assert "BUILD | view:verbose | details:collapsed | plan:none | tip:Shift+Tab plan mode" in rendered

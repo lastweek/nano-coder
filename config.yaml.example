@@ -34,6 +34,11 @@ subagents:
   max_per_turn: 6
   default_timeout_seconds: 180
 
+plan:
+  enabled: true
+  plan_dir: .nano-coder/plans
+  allow_subagents: true
+
 # MCP (Model Context Protocol) Servers
 # External tool servers that nano-coder can connect to
 mcp:

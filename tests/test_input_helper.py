@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
@@ -206,3 +207,41 @@ def test_get_input_round_trips_unmatched_dollar_tokens(tmp_path):
     with create_input_helper(tmp_path) as (helper, pipe_input, _output):
         pipe_input.send_text("$HOME/path\n")
         assert helper.get_input("> ") == "$HOME/path"
+
+
+def test_bottom_toolbar_callback_is_rendered_and_exposed_as_text(tmp_path):
+    """Idle toolbar callbacks should feed the prompt toolbar and plain-text inspection."""
+    with create_input_helper(tmp_path) as (_helper, pipe_input, output):
+        helper = InputHelper(
+            history_file=tmp_path / "history-toolbar.txt",
+            command_names=["help"],
+            command_descriptions={"help": "Show commands"},
+            skill_names=[],
+            bottom_toolbar_callback=lambda: HTML("<style fg='ansicyan'>BUILD</style>"),
+            input=pipe_input,
+            output=output,
+        )
+
+        assert helper.get_bottom_toolbar_text() == "BUILD"
+        assert helper.build_bottom_toolbar() is not None
+
+
+def test_toggle_plan_mode_invokes_callback(tmp_path):
+    """The prompt shortcut handler should invoke the plan toggle callback."""
+    called = {"count": 0}
+
+    with create_pipe_input() as pipe_input:
+        output = DummyOutput()
+        with create_app_session(input=pipe_input, output=output):
+            helper = InputHelper(
+                history_file=tmp_path / "history-toggle.txt",
+                command_names=[],
+                skill_names=[],
+                toggle_plan_mode_callback=lambda: called.__setitem__("count", called["count"] + 1),
+                input=pipe_input,
+                output=output,
+            )
+
+            helper.toggle_plan_mode()
+
+    assert called["count"] == 1

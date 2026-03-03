@@ -626,7 +626,8 @@ def test_agent_batches_consecutive_run_subagent_calls(temp_dir):
     )
     agent.logger.close()
 
-    assert processed == 2
+    assert processed.processed_count == 2
+    assert processed.terminal_response is None
     assert [request.task for request in fake_manager.seen_requests] == ["a", "b"]
     assert len(messages) == 2
     assert json.loads(messages[0]["content"])["subagent_id"] == "sa_0001"
@@ -696,7 +697,8 @@ def test_agent_preserves_tool_call_order_with_invalid_subagent_arguments(temp_di
     )
     agent.logger.close()
 
-    assert processed == 3
+    assert processed.processed_count == 3
+    assert processed.terminal_response is None
     assert [request.task for request in fake_manager.seen_requests] == ["a", "b"]
     assert json.loads(messages[0]["content"])["subagent_id"] == "sa_0001"
     assert "Invalid JSON in tool arguments" in json.loads(messages[1]["content"])["error"]
@@ -779,7 +781,8 @@ def test_agent_preserves_order_around_subagent_batch(temp_dir):
     )
     agent.logger.close()
 
-    assert processed == 4
+    assert processed.processed_count == 4
+    assert processed.terminal_response is None
     assert [json.loads(message["content"]) for message in messages] == [
         {"output": "before"},
         {

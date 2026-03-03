@@ -1,18 +1,20 @@
 """Input handling with prompt_toolkit for better UX."""
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, CompleteEvent, Completion
 from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import HTML, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.filters import has_completions
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.output.base import Output
 from prompt_toolkit.shortcuts import CompleteStyle
+from prompt_toolkit.formatted_text.base import AnyFormattedText
 
 
 def _get_active_prefixed_fragment(
@@ -105,6 +107,8 @@ class InputHelper:
         command_names: Optional[List[str]] = None,
         command_descriptions: Optional[dict] = None,
         skill_names: Optional[List[str]] = None,
+        bottom_toolbar_callback: Optional[Callable[[], AnyFormattedText]] = None,
+        toggle_plan_mode_callback: Optional[Callable[[], None]] = None,
         mouse_support: bool = False,
         input: Optional[Input] = None,
         output: Optional[Output] = None,
@@ -116,6 +120,8 @@ class InputHelper:
             command_names: List of command names for tab completion (without /)
             command_descriptions: Dict mapping command names to short descriptions
             skill_names: List of skill names for $skill completion (without $)
+            bottom_toolbar_callback: Optional callback for idle statusline content
+            toggle_plan_mode_callback: Optional callback for toggling plan mode
             mouse_support: Whether prompt_toolkit mouse tracking is enabled
             input: Optional prompt_toolkit input for testing
             output: Optional prompt_toolkit output for testing
@@ -127,6 +133,8 @@ class InputHelper:
         self.command_names = list(command_names or [])
         self.command_descriptions = dict(command_descriptions or {})
         self.skill_names = list(skill_names or [])
+        self.bottom_toolbar_callback = bottom_toolbar_callback
+        self.toggle_plan_mode_callback = toggle_plan_mode_callback
 
         self.command_completer = self._build_command_completer()
         self.skill_completer = self._build_skill_completer()
@@ -162,6 +170,12 @@ class InputHelper:
             """Dismiss the command completion menu."""
             self._cancel_completion(event.app.current_buffer)
 
+        @kb.add(Keys.BackTab)
+        def _(event):
+            """Toggle plan mode from the prompt via Shift+Tab."""
+            self.toggle_plan_mode()
+            event.app.invalidate()
+
         self.session = PromptSession(
             history=self.history,
             enable_history_search=True,
@@ -173,6 +187,7 @@ class InputHelper:
             complete_while_typing=False,
             complete_style=CompleteStyle.COLUMN,
             reserve_space_for_menu=8,
+            bottom_toolbar=self.build_bottom_toolbar,
             input=input,
             output=output,
         )
@@ -312,6 +327,28 @@ class InputHelper:
             self.session.default_buffer,
             select_first=self.session.default_buffer.complete_state is not None,
         )
+
+    def get_bottom_toolbar_text(self) -> str:
+        """Return the current idle statusline text."""
+        if self.bottom_toolbar_callback is None:
+            return ""
+        formatted = to_formatted_text(self.bottom_toolbar_callback())
+        return "".join(fragment[1] for fragment in formatted).strip()
+
+    def toggle_plan_mode(self) -> None:
+        """Toggle the session between build mode and plan mode."""
+        if self.toggle_plan_mode_callback is None:
+            return
+        self.toggle_plan_mode_callback()
+
+    def build_bottom_toolbar(self) -> AnyFormattedText:
+        """Build the prompt-toolkit bottom toolbar."""
+        if self.bottom_toolbar_callback is None:
+            return ""
+        toolbar = self.bottom_toolbar_callback()
+        if not toolbar:
+            return ""
+        return toolbar
 
     def get_input(self, prompt: str = "> ") -> str:
         """Get user input with enhanced editing.

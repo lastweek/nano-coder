@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from src.context import Context
@@ -19,7 +19,10 @@ ROLE_TOOL = "tool"
 # Constants for request kind tracking
 REQUEST_KIND_AGENT_TURN = "agent_turn"
 REQUEST_KIND_CONTEXT_COMPACTION = "context_compaction"
+REQUEST_KIND_PLAN_TURN = "plan_turn"
 REQUEST_KIND_SUBAGENT_TURN = "subagent_turn"
+
+ToolProfile = Literal["build", "plan_main", "plan_subagent", "build_subagent"]
 
 
 @dataclass
@@ -94,35 +97,72 @@ def build_tool_registry(
     mcp_manager=None,
     subagent_manager=None,
     include_subagent_tool: bool = True,
+    tool_profile: ToolProfile = "build",
 ) -> ToolRegistry:
     """Build the standard tool registry for a parent or child agent."""
     from src.config import config
     from src.tools.bash import BashTool
+    from src.tools.plan_submit import SubmitPlanTool
+    from src.tools.plan_write import WritePlanTool
     from src.tools.read import ReadTool
+    from src.tools.readonly_shell import ReadOnlyShellTool
     from src.tools.skill import LoadSkillTool
     from src.tools.subagent import RunSubagentTool
     from src.tools.write import WriteTool
 
     registry = ToolRegistry()
     registry.register(ReadTool())
-    registry.register(WriteTool())
-    registry.register(BashTool())
     registry.register(LoadSkillTool(skill_manager))
 
-    if mcp_manager is not None:
-        mcp_manager.register_tools(registry)
+    if tool_profile == "build":
+        registry.register(WriteTool())
+        registry.register(BashTool())
+        if mcp_manager is not None:
+            mcp_manager.register_tools(registry)
+        if include_subagent_tool and subagent_manager is not None and config.subagents.enabled:
+            registry.register(RunSubagentTool(subagent_manager))
+        return registry
 
-    if include_subagent_tool and subagent_manager is not None and config.subagents.enabled:
-        registry.register(RunSubagentTool(subagent_manager))
+    if tool_profile == "build_subagent":
+        registry.register(WriteTool())
+        registry.register(BashTool())
+        if mcp_manager is not None:
+            mcp_manager.register_tools(registry)
+        return registry
+
+    registry.register(ReadOnlyShellTool())
+
+    if tool_profile == "plan_main":
+        registry.register(WritePlanTool())
+        registry.register(SubmitPlanTool())
+        if (
+            include_subagent_tool
+            and subagent_manager is not None
+            and config.subagents.enabled
+            and config.plan.allow_subagents
+        ):
+            registry.register(RunSubagentTool(subagent_manager))
+        return registry
+
+    if tool_profile == "plan_subagent":
+        return registry
 
     return registry
 
 
-def clone_tool_registry(source: ToolRegistry, *, include_subagent_tool: bool = True) -> ToolRegistry:
+def clone_tool_registry(
+    source: ToolRegistry,
+    *,
+    include_subagent_tool: bool = True,
+    exclude_tools: set[str] | None = None,
+) -> ToolRegistry:
     """Clone a registry by reusing tool instances from an existing registry."""
     registry = ToolRegistry()
+    excluded = set(exclude_tools or set())
     for tool in source._tools.values():
         if not include_subagent_tool and tool.name == "run_subagent":
+            continue
+        if tool.name in excluded:
             continue
         registry.register(tool)
     return registry
@@ -133,12 +173,14 @@ __all__ = [
     "clone_tool_registry",
     "REQUEST_KIND_AGENT_TURN",
     "REQUEST_KIND_CONTEXT_COMPACTION",
+    "REQUEST_KIND_PLAN_TURN",
     "REQUEST_KIND_SUBAGENT_TURN",
     "ROLE_ASSISTANT",
     "ROLE_SYSTEM",
     "ROLE_TOOL",
     "ROLE_USER",
     "Tool",
+    "ToolProfile",
     "ToolRegistry",
     "ToolResult",
 ]

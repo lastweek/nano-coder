@@ -9,9 +9,11 @@ from src.activity_preview import (
     build_tool_result_preview,
     build_tool_signature,
 )
+from src.plan_mode import build_build_execution_contract, build_plan_prompt
 from src.tools import (
     ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL,
     REQUEST_KIND_AGENT_TURN,
+    REQUEST_KIND_PLAN_TURN,
 )
 from src.logger import SessionLogger
 from src.metrics import LLMMetrics
@@ -36,6 +38,14 @@ class _ModelIterationResult:
     outcome: Literal["final_answer", "tool_calls"]
     assistant_text: str
     requested_tool_calls: List[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _ToolProcessingResult:
+    """Outcome of processing one model-issued tool-call batch."""
+
+    processed_count: int
+    terminal_response: str | None = None
 
 
 @dataclass
@@ -106,36 +116,19 @@ class Agent:
                 min_recent_turns=current_config.context.min_recent_turns,
             ),
         )
-
-        # Pre-build system message (hot-path optimization - avoids rebuilding on each request)
-        tool_descriptions = "\n".join(
-            f"- {tool.name}: {tool.description}"
-            for tool in self.tools._tools.values()
-        )
-
-        self._cached_system_prompt_base = f"""You are a helpful coding assistant with access to tools.
-
-Working directory: {self.context.cwd}
-
-Available tools:
-{tool_descriptions}
-
-When asked to do something that requires tools, use them. Always explain what you're doing before using a tool.
-Think step by step. If you make a mistake, try to recover.
-
-Be concise and helpful."""
-        if self.tools.get("run_subagent") is not None:
-            self._cached_system_prompt_base += (
-                "\n\nWhen a task can be split into independent repo subtasks, you may delegate it with run_subagent."
-            )
-
-        # Tool schemas cached on first use (expensive to build)
         self._cached_tool_schemas = None
         self._skill_event_callback = None
+        self._refresh_system_prompt_base()
 
     def set_skill_event_callback(self, callback: Optional[Callable]) -> None:
         """Set an optional callback for skill debug events."""
         self._skill_event_callback = callback
+
+    def set_tool_registry(self, tools) -> None:
+        """Replace the active tool registry and invalidate cached prompt/schema state."""
+        self.tools = tools
+        self._cached_tool_schemas = None
+        self._refresh_system_prompt_base()
 
     def _build_system_message(self) -> Dict:
         """Build the system message for the current turn."""
@@ -144,12 +137,26 @@ Be concise and helpful."""
     def _build_system_prompt(self) -> str:
         """Build the full system prompt for the current turn."""
         sections = [self._cached_system_prompt_base]
+        mode_section = self._build_mode_prompt_section()
+        if mode_section:
+            sections.append(mode_section)
 
         skill_catalog = self._build_skill_catalog_section()
         if skill_catalog:
             sections.append(skill_catalog)
 
         return "\n\n".join(section for section in sections if section)
+
+    def _build_mode_prompt_section(self) -> str:
+        """Build any session-mode-specific prompt section for this turn."""
+        if self.context.get_session_mode() == "plan":
+            return build_plan_prompt(
+                self.context,
+                can_write_plan=self.tools.get("write_plan") is not None,
+                can_submit_plan=self.tools.get("submit_plan") is not None,
+            )
+
+        return build_build_execution_contract(self.context)
 
     def _build_skill_catalog_section(self) -> str:
         """Build the compact catalog of discovered skills for this session."""
@@ -231,8 +238,39 @@ Be concise and helpful."""
             "turn_id": turn_id,
             "iteration": iteration,
             "stream": stream,
-            "request_kind": self.request_kind,
+            "request_kind": self._current_request_kind(),
         }
+
+    def _current_request_kind(self) -> str:
+        """Return the request kind for the current turn."""
+        if self.request_kind != REQUEST_KIND_AGENT_TURN:
+            return self.request_kind
+        if self.context.get_session_mode() == "plan":
+            return REQUEST_KIND_PLAN_TURN
+        return self.request_kind
+
+    def _refresh_system_prompt_base(self) -> None:
+        """Rebuild the static prompt base from the current tool registry."""
+        tool_descriptions = "\n".join(
+            f"- {tool.name}: {tool.description}"
+            for tool in self.tools._tools.values()
+        )
+
+        self._cached_system_prompt_base = f"""You are a helpful coding assistant with access to tools.
+
+Working directory: {self.context.cwd}
+
+Available tools:
+{tool_descriptions}
+
+When asked to do something that requires tools, use them. Always explain what you're doing before using a tool.
+Think step by step. If you make a mistake, try to recover.
+
+Be concise and helpful."""
+        if self.tools.get("run_subagent") is not None:
+            self._cached_system_prompt_base += (
+                "\n\nWhen a task can be split into independent repo subtasks, you may delegate it with run_subagent."
+            )
 
     def _emit_llm_call_started(
         self,
@@ -577,6 +615,27 @@ Be concise and helpful."""
 
         return self._build_tool_result_message(tool_id, result), result
 
+    def _execute_submit_plan_tool(
+        self,
+        tool_call: Dict[str, Any],
+        parsed_args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Execute submit_plan and return the raw control-plane payload."""
+        tool = self.tools.get("submit_plan")
+        if tool is None:
+            return {"error": "submit_plan is not available in the current tool profile"}
+
+        result_obj = tool.execute(self.context, **parsed_args)
+        if not result_obj.success:
+            return {"error": result_obj.error or "submit_plan failed"}
+
+        if isinstance(result_obj.data, dict):
+            return result_obj.data
+        return {
+            "summary": str(result_obj.data or ""),
+            "report": str(result_obj.data or ""),
+        }
+
     def _process_subagent_tool_batch(
         self,
         tool_calls: List[Dict],
@@ -701,7 +760,7 @@ Be concise and helpful."""
         on_event: Optional[TurnActivityCallback] = None,
         tools_used: Optional[List[str]] = None,
         skills_used: Optional[List[str]] = None,
-    ) -> int:
+    ) -> _ToolProcessingResult:
         """Process multiple tool calls and add results to messages.
 
         Args:
@@ -772,6 +831,66 @@ Be concise and helpful."""
                 tool_call_id=tool_call_id,
             )
 
+            if tool_name == "submit_plan":
+                result_content = self._execute_submit_plan_tool(current_tool_call, parsed_args)
+                self.logger.log_tool_result(
+                    turn_id=turn_id,
+                    iteration=iteration,
+                    tool_name=tool_name,
+                    result=result_content,
+                    tool_call_id=tool_call_id,
+                )
+                result_preview, result_body = build_tool_result_preview(tool_name, result_content)
+                self._emit_turn_event(
+                    on_event,
+                    "tool_call_finished",
+                    iteration=iteration,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    arguments=parsed_args,
+                    success="error" not in result_content,
+                    duration_s=0.0,
+                    error=result_content.get("error"),
+                    result_preview=result_preview,
+                    result_body=result_body,
+                )
+                if "error" in result_content:
+                    messages.append(self._build_tool_result_message(tool_call_id, result_content))
+                    index += 1
+                    continue
+
+                submitted_plan = self.context.get_current_plan()
+                submitted_report = (
+                    submitted_plan.report
+                    if submitted_plan is not None and submitted_plan.report
+                    else str(result_content.get("report", ""))
+                )
+                submitted_summary = (
+                    submitted_plan.summary
+                    if submitted_plan is not None and submitted_plan.summary
+                    else str(result_content.get("summary", ""))
+                )
+                self.logger.log_plan_event(
+                    turn_id=turn_id,
+                    stage="submitted",
+                    plan_id=submitted_plan.plan_id if submitted_plan is not None else None,
+                    status=submitted_plan.status if submitted_plan is not None else "ready_for_review",
+                    file_path=submitted_plan.file_path if submitted_plan is not None else None,
+                    summary=submitted_summary,
+                )
+                self._emit_turn_event(
+                    on_event,
+                    "plan_submitted",
+                    iteration=iteration,
+                    summary=submitted_summary,
+                    plan_id=submitted_plan.plan_id if submitted_plan is not None else None,
+                    file_path=submitted_plan.file_path if submitted_plan is not None else None,
+                )
+                return _ToolProcessingResult(
+                    processed_count=processed_count,
+                    terminal_response=submitted_report,
+                )
+
             tool_result_message, result_content = self._execute_standard_tool_call(current_tool_call, parsed_args)
             messages.append(tool_result_message)
             duration_s = perf_counter() - started_at
@@ -815,8 +934,24 @@ Be concise and helpful."""
                 self._emit_skill_event(turn_id, skill_event_name, **event_details)
                 cli_details = {key: value for key, value in event_details.items() if key != "iteration"}
                 self._emit_turn_event(on_event, cli_event_name, iteration=iteration, **cli_details)
+            if tool_name == "write_plan" and "error" not in result_content:
+                current_plan = self.context.get_current_plan()
+                self.logger.log_plan_event(
+                    turn_id=turn_id,
+                    stage="written",
+                    plan_id=current_plan.plan_id if current_plan is not None else None,
+                    status=current_plan.status if current_plan is not None else "draft",
+                    file_path=current_plan.file_path if current_plan is not None else None,
+                )
+                self._emit_turn_event(
+                    on_event,
+                    "plan_written",
+                    iteration=iteration,
+                    plan_id=current_plan.plan_id if current_plan is not None else None,
+                    file_path=current_plan.file_path if current_plan is not None else None,
+                )
             index += 1
-        return processed_count
+        return _ToolProcessingResult(processed_count=processed_count)
 
     def _append_completed_turn_to_context(self, user_message: str, final_response: str) -> None:
         """Save and log final agent response.
@@ -1133,7 +1268,7 @@ Be concise and helpful."""
                     turn_state.is_finished = True
                     return final_response
 
-                turn_state.tool_call_count += self._process_tool_calls(
+                tool_processing_result = self._process_tool_calls(
                     model_iteration.requested_tool_calls,
                     turn_state.conversation_messages,
                     turn_state.turn_id,
@@ -1143,6 +1278,19 @@ Be concise and helpful."""
                     turn_state.tools_used,
                     turn_state.skills_used,
                 )
+                turn_state.tool_call_count += tool_processing_result.processed_count
+                if tool_processing_result.terminal_response is not None:
+                    final_response = self._finish_successful_turn(
+                        turn_id=turn_state.turn_id,
+                        user_message=turn_state.normalized_user_message,
+                        final_response=tool_processing_result.terminal_response,
+                        tool_call_count=turn_state.tool_call_count,
+                        tools_used=turn_state.tools_used,
+                        skills_used=turn_state.skills_used,
+                        on_event=on_event,
+                    )
+                    turn_state.is_finished = True
+                    return final_response
 
             if stream:
                 error_response = "I reached the maximum number of iterations. Please try a simpler request."

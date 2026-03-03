@@ -2,8 +2,19 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Dict, Optional
+from typing import Any, Dict, List, Literal, Optional
 import uuid
+
+
+SessionMode = Literal["build", "plan"]
+PlanStatus = Literal[
+    "draft",
+    "ready_for_review",
+    "approved",
+    "rejected",
+    "executing",
+    "completed",
+]
 
 
 @dataclass
@@ -28,6 +39,22 @@ class ConversationTurn:
 
 
 @dataclass
+class SessionPlan:
+    """Session-local plan artifact and approval state."""
+
+    plan_id: str
+    status: PlanStatus
+    task: str
+    file_path: str
+    content: str
+    summary: str
+    created_at: str
+    updated_at: str
+    approved_at: str | None = None
+    report: str = ""
+
+
+@dataclass
 class Context:
     """Session context passed to all operations."""
     cwd: Path
@@ -39,6 +66,9 @@ class Context:
     last_prompt_cached_tokens: Optional[int] = None
     last_context_window: Optional[int] = None
     auto_compaction_enabled: bool = True
+    session_mode: SessionMode = "build"
+    current_plan: SessionPlan | None = None
+    active_approved_plan_id: str | None = None
 
     @classmethod
     def create(cls, cwd: str = ".") -> 'Context':
@@ -78,6 +108,34 @@ class Context:
     def get_active_skills(self) -> List[str]:
         """Return pinned skill names."""
         return list(self.active_skills)
+
+    def get_session_mode(self) -> SessionMode:
+        """Return the current top-level session mode."""
+        return self.session_mode
+
+    def set_session_mode(self, mode: SessionMode) -> None:
+        """Set the current top-level session mode."""
+        self.session_mode = mode
+
+    def get_current_plan(self) -> SessionPlan | None:
+        """Return the current session-local plan artifact."""
+        return self.current_plan
+
+    def set_current_plan(self, plan: SessionPlan | None) -> None:
+        """Replace the current session-local plan artifact."""
+        self.current_plan = plan
+
+    def clear_active_plan_contract(self) -> None:
+        """Clear the currently active approved execution contract."""
+        self.active_approved_plan_id = None
+
+    def get_active_approved_plan(self) -> SessionPlan | None:
+        """Return the currently active approved plan contract, if any."""
+        if self.current_plan is None:
+            return None
+        if self.current_plan.plan_id != self.active_approved_plan_id:
+            return None
+        return self.current_plan
 
     def get_complete_turns(self) -> List[ConversationTurn]:
         """Return the longest valid alternating prefix of complete user/assistant turns."""

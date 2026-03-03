@@ -11,6 +11,8 @@ from rich.console import Group, RenderableType
 from rich.text import Text
 
 from src.activity_preview import build_tool_signature
+from src.context import Context
+from src.statusline import build_rich_statusline
 from src.turn_activity import TurnActivityEvent
 
 MAIN_AGENT_LABEL_STYLE = "bold #7dd3fc"
@@ -66,6 +68,7 @@ class TurnProgressDisplay:
     def __init__(
         self,
         *,
+        session_context: Context | None = None,
         skill_debug: bool = False,
         request_type: str = "streaming",
         live_activity_mode: Literal["simple", "verbose"] = "simple",
@@ -76,6 +79,7 @@ class TurnProgressDisplay:
         self.streaming_started = False
         self.skill_debug = skill_debug
         self.request_type = request_type
+        self.session_context = session_context
         self.turn_started_at = perf_counter()
         self._lock = RLock()
         self.live_state = TurnLiveViewState(
@@ -160,6 +164,14 @@ class TurnProgressDisplay:
                 renderables.append(
                     Text("v: simple/verbose  z: fold/unfold  ?: controls", style="dim")
                 )
+            if self.session_context is not None:
+                renderables.append(
+                    build_rich_statusline(
+                        self.session_context,
+                        view_mode=self.live_state.mode,
+                        detail_mode=self.live_state.detail_mode,
+                    )
+                )
             elif renderables:
                 renderables.pop()
 
@@ -228,6 +240,29 @@ class TurnProgressDisplay:
 
         if event.kind == "skill_preload":
             worker.phase = "preparing skills"
+            return
+        if event.kind == "plan_mode_entered":
+            worker.phase = "planning"
+            worker.status = "running"
+            return
+        if event.kind == "plan_written":
+            worker.phase = "planning"
+            return
+        if event.kind == "plan_submitted":
+            worker.phase = "awaiting plan review"
+            return
+        if event.kind == "plan_approved":
+            worker.phase = "plan approved"
+            return
+        if event.kind == "plan_rejected":
+            worker.phase = "plan rejected"
+            return
+        if event.kind == "plan_execution_started":
+            worker.phase = "executing approved plan"
+            worker.status = "running"
+            return
+        if event.kind == "plan_cleared":
+            worker.phase = "build"
             return
         if event.kind == "context_compaction_started":
             worker.phase = "compacting context"
@@ -498,6 +533,42 @@ class TurnProgressDisplay:
             title = f"Skill preloaded: {event.details.get('skill_name')} ({event.details.get('reason')})"
             return TranscriptEntry("status", title, "finished", None, title)
 
+        if event.kind == "plan_mode_entered":
+            title = f"Entered planning mode for: {event.details.get('task')}"
+            return TranscriptEntry("status", title, "finished", None, title)
+
+        if event.kind == "plan_written":
+            title = f"Plan artifact updated: {event.details.get('file_path')}"
+            return TranscriptEntry("status", title, "finished", None, title)
+
+        if event.kind == "plan_submitted":
+            title = "Plan submitted for review"
+            return TranscriptEntry(
+                "status",
+                title,
+                "finished",
+                None,
+                title,
+                body_label="summary" if event.details.get("summary") else None,
+                body_text=event.details.get("summary"),
+            )
+
+        if event.kind == "plan_approved":
+            title = "Plan approved"
+            return TranscriptEntry("status", title, "finished", None, title)
+
+        if event.kind == "plan_rejected":
+            title = "Plan rejected"
+            return TranscriptEntry("status", title, "failed", None, title)
+
+        if event.kind == "plan_execution_started":
+            title = "Started executing approved plan"
+            return TranscriptEntry("status", title, "running", None, title)
+
+        if event.kind == "plan_cleared":
+            title = "Cleared approved plan contract"
+            return TranscriptEntry("status", title, "finished", None, title)
+
         if event.kind == "context_compaction_started":
             title = f"Compacting context: {event.details.get('covered_turn_count', 0)} older turns"
             return TranscriptEntry("status", title, "running", None, title)
@@ -577,6 +648,27 @@ class TurnProgressDisplay:
                     f"catalog={'yes' if details.get('catalog_visible') else 'no'}]"
                 )
             return line
+
+        if event.kind == "plan_mode_entered":
+            return f"Entered planning mode for: {details.get('task')}"
+
+        if event.kind == "plan_written":
+            return f"Plan updated: {details.get('file_path')}"
+
+        if event.kind == "plan_submitted":
+            return "Plan submitted for review"
+
+        if event.kind == "plan_approved":
+            return "Plan approved"
+
+        if event.kind == "plan_rejected":
+            return "Plan rejected"
+
+        if event.kind == "plan_execution_started":
+            return "Started executing approved plan"
+
+        if event.kind == "plan_cleared":
+            return "Cleared approved plan contract"
 
         if event.kind == "context_compaction_completed":
             return f"Context compacted: {details.get('covered_turn_count', 0)} older turns summarized"

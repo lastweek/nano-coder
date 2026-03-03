@@ -572,6 +572,7 @@ class MCPManager:
         """Initialize the MCP manager from configuration."""
         self._debug = debug
         self._servers: Dict[str, MCPServer] = {}
+        self._cached_tool_defs: Dict[str, List[Dict[str, Any]]] = {}
 
         if self._debug:
             print(f"[MCP] Initializing MCP manager with {len(servers_config)} server(s)")
@@ -606,10 +607,16 @@ class MCPManager:
 
         for server in self._servers.values():
             try:
-                if self._debug:
-                    print(f"[MCP] Contacting {server.name} for tool list...")
+                if server.name in self._cached_tool_defs:
+                    tools_defs = deepcopy(self._cached_tool_defs[server.name])
+                    if self._debug:
+                        print(f"[MCP] Reusing cached tools for {server.name}")
+                else:
+                    if self._debug:
+                        print(f"[MCP] Contacting {server.name} for tool list...")
 
-                tools_defs = server.list_tools()
+                    tools_defs = server.list_tools()
+                    self._cached_tool_defs[server.name] = deepcopy(tools_defs)
 
                 if self._debug:
                     print(f"[MCP] Found {len(tools_defs)} tool(s) from {server.name}")
@@ -624,6 +631,10 @@ class MCPManager:
 
         if self._debug:
             print("[MCP] Tool discovery complete")
+
+    def clear_tool_cache(self) -> None:
+        """Clear cached MCP tool definitions so discovery runs again."""
+        self._cached_tool_defs.clear()
 
     def get_server_status(self) -> Dict[str, bool]:
         """Check the health status of all MCP servers."""

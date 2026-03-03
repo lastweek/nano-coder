@@ -8,6 +8,13 @@ from typing import Any, Callable, Literal, Optional
 
 
 TurnActivityKind = Literal[
+    "plan_mode_entered",
+    "plan_written",
+    "plan_submitted",
+    "plan_approved",
+    "plan_rejected",
+    "plan_execution_started",
+    "plan_cleared",
     "context_compaction_started",
     "context_compaction_completed",
     "context_compaction_failed",
@@ -34,6 +41,13 @@ class TurnActivityEvent:
     """A user-safe activity event emitted during a turn.
 
     `details` keys by event kind:
+    - `plan_mode_entered`: `task`, `plan_id`, `file_path`
+    - `plan_written`: `plan_id`, `file_path`
+    - `plan_submitted`: `plan_id`, `file_path`, `summary`
+    - `plan_approved`: `plan_id`, `file_path`
+    - `plan_rejected`: `plan_id`, `file_path`
+    - `plan_execution_started`: `plan_id`, `file_path`
+    - `plan_cleared`: `plan_id`
     - `context_compaction_started`: `reason`, `covered_turn_count`,
       `retained_turn_count`
     - `context_compaction_completed`: `reason`, `covered_turn_count`,

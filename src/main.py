@@ -20,6 +20,7 @@ from rich.live import Live
 from src.context import Context
 from src.llm import LLMClient
 from src.metrics import LLMMetrics
+from src.plan_mode import create_session_plan
 from src.tools import build_tool_registry
 from src.agent import Agent
 from src.config import config
@@ -27,6 +28,7 @@ from src.mcp import MCPManager
 from src.skills import SkillManager
 from src.commands import CommandRegistry
 from src.commands import builtin
+from src.statusline import build_prompt_toolbar
 from src.turn_display import TurnProgressDisplay
 from src.turn_controls import LiveTurnControls
 from src.subagents import SubagentManager
@@ -34,6 +36,12 @@ from src.subagents import SubagentManager
 REQUEST_TYPE_STREAMING = "streaming"
 REQUEST_TYPE_NON_STREAMING = "non-streaming"
 DEBUG_ENABLED_VALUES = ("1", "true", "yes")
+NANO_CODER_WORDMARK = r""" _   _                        ____          _
+| \ | | __ _ _ __   ___      / ___|___   __| | ___ _ __
+|  \| |/ _` | '_ \ / _ \____| |   / _ \ / _` |/ _ \ '__|
+| |\  | (_| | | | | (_) |____| |__| (_) | (_| |  __/ |
+|_| \_|\__,_|_| |_|\___/      \____\___/ \__,_|\___|_|
+"""
 
 
 def print_banner(console: Console) -> None:
@@ -53,8 +61,9 @@ def print_banner(console: Console) -> None:
         llm_info_lines.append(Text(f"Provider: {config.llm.provider}", style="dim"))
 
     # Build panel content
-    panel_content = Text("Nano-Coder", style="bold cyan") + "\n" + \
-                    Text("Minimalism Terminal Code Agent", style="dim")
+    panel_content = Text(NANO_CODER_WORDMARK.rstrip("\n"), style="bold cyan")
+    panel_content.append("\n")
+    panel_content.append("Minimalism Terminal Code Agent", style="dim")
 
     # Add LLM info if available
     if llm_info_lines:
@@ -142,6 +151,7 @@ def run_agent_turn(
     """Run one agent turn with a live chronological activity feed."""
     request_type = REQUEST_TYPE_STREAMING if enable_streaming else REQUEST_TYPE_NON_STREAMING
     display = TurnProgressDisplay(
+        session_context=agent.context,
         skill_debug=skill_debug,
         request_type=request_type,
         live_activity_mode=config.ui.live_activity_mode,
@@ -178,6 +188,28 @@ def run_agent_turn(
         console.print()
         console.print(Markdown(response))
 
+    return response
+
+
+def execute_user_turn(
+    console: Console,
+    agent,
+    user_input: str,
+    *,
+    enable_streaming: bool,
+    skill_debug: bool,
+) -> str:
+    """Run one user-visible turn and print its final metrics summary."""
+    console.print("\n[bold cyan]Agent[/bold cyan] >")
+    response = run_agent_turn(
+        console,
+        agent,
+        user_input,
+        enable_streaming=enable_streaming,
+        skill_debug=skill_debug,
+    )
+    request_type = REQUEST_TYPE_STREAMING if enable_streaming else REQUEST_TYPE_NON_STREAMING
+    display_metrics(console, agent.request_metrics, request_type)
     return response
 
 
@@ -296,6 +328,7 @@ def main() -> None:
         mcp_manager=mcp_manager,
         subagent_manager=subagent_manager,
         include_subagent_tool=config.subagents.enabled,
+        tool_profile="build",
     )
 
     # Create agent
@@ -310,6 +343,18 @@ def main() -> None:
     # Create command registry and register built-in commands
     registry = CommandRegistry()
     builtin.register_all(registry)
+
+    def set_tool_profile_callback(tool_profile: str) -> None:
+        """Rebuild the parent tool registry for the requested session tool profile."""
+        rebuilt_tools = build_tool_registry(
+            skill_manager=skill_manager,
+            mcp_manager=mcp_manager,
+            subagent_manager=subagent_manager,
+            include_subagent_tool=True,
+            tool_profile=tool_profile,
+        )
+        agent.set_tool_registry(rebuilt_tools)
+        cmd_context["tools"] = rebuilt_tools
 
     # Create execution context for commands
     cmd_context = {
@@ -329,13 +374,51 @@ def main() -> None:
     # Get command names for completion
     command_names = registry.get_command_names()
 
+    def build_idle_statusline():
+        """Build the idle prompt statusline from session state and default view settings."""
+        return build_prompt_toolbar(
+            context,
+            view_mode=config.ui.live_activity_mode,
+            detail_mode=config.ui.live_activity_details,
+        )
+
+    def toggle_plan_mode() -> None:
+        """Toggle the top-level session mode between build and plan."""
+        if not config.plan.enabled:
+            return
+
+        if context.get_session_mode() == "plan":
+            context.set_session_mode("build")
+            set_tool_profile_callback("build")
+            return
+
+        if context.get_current_plan() is None:
+            create_session_plan(
+                context,
+                task="Interactive planning session",
+                plan_dir=config.plan.plan_dir,
+            )
+        context.set_session_mode("plan")
+        set_tool_profile_callback("plan_main")
+
     # Initialize input helper for bash-like editing with command completion
     input_helper = InputHelper(
         command_names=command_names,
         command_descriptions=command_descriptions,
         skill_names=[skill.name for skill in skill_manager.list_skills()],
+        bottom_toolbar_callback=build_idle_statusline,
+        toggle_plan_mode_callback=toggle_plan_mode,
     )
     cmd_context["input_helper"] = input_helper
+    cmd_context["prompt_input_callback"] = input_helper.get_input
+    cmd_context["set_tool_profile_callback"] = set_tool_profile_callback
+    cmd_context["run_agent_turn_callback"] = lambda prompt: execute_user_turn(
+        console,
+        agent,
+        prompt,
+        enable_streaming=enable_streaming,
+        skill_debug=skill_debug,
+    )
 
     # Print banner
     print_banner(console)
@@ -362,27 +445,13 @@ def main() -> None:
                     console.print("\n[yellow]Goodbye![/yellow]")
                     break
 
-                # Process through agent
-                console.print("\n[bold cyan]Agent[/bold cyan] >")
-
-                if enable_streaming:
-                    response = run_agent_turn(
-                        console,
-                        agent,
-                        user_input,
-                        enable_streaming=True,
-                        skill_debug=skill_debug,
-                    )
-                    display_metrics(console, agent.request_metrics, REQUEST_TYPE_STREAMING)
-                else:
-                    response = run_agent_turn(
-                        console,
-                        agent,
-                        user_input,
-                        enable_streaming=False,
-                        skill_debug=skill_debug,
-                    )
-                    display_metrics(console, agent.request_metrics, REQUEST_TYPE_NON_STREAMING)
+                response = execute_user_turn(
+                    console,
+                    agent,
+                    user_input,
+                    enable_streaming=enable_streaming,
+                    skill_debug=skill_debug,
+                )
 
             except KeyboardInterrupt:
                 console.print("\n\n[yellow]Interrupted. Type 'exit' to quit.[/yellow]")

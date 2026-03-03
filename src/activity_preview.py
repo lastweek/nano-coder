@@ -70,9 +70,23 @@ def build_tool_result_preview(tool_name: str, result: dict[str, Any]) -> tuple[s
         body = _sanitize_body(output)
         return _truncate_single_line(body or "Wrote file"), body
 
+    if tool_name == "write_plan" and isinstance(output, str):
+        body = _sanitize_body(output)
+        return _truncate_single_line(body or "Updated plan"), body
+
     if tool_name == "run_command":
         body = _sanitize_body(str(output))
         return _truncate_single_line(body or "Command completed"), body
+
+    if tool_name == "run_readonly_command":
+        body = _sanitize_body(str(output))
+        return _truncate_single_line(body or "Read-only command completed"), body
+
+    if tool_name == "submit_plan":
+        body = _sanitize_body(
+            str(result.get("report") or result.get("summary") or output or "Plan submitted")
+        )
+        return _truncate_single_line(body or "Plan submitted"), body
 
     if tool_name == "load_skill" and isinstance(output, str):
         body = _sanitize_body(output)

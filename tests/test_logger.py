@@ -283,6 +283,72 @@ class TestSessionLogger:
         assert "context_compaction_started" in kinds
         assert "context_compaction_completed" in kinds
 
+    def test_logs_plan_lifecycle_and_request_kind(self, temp_dir):
+        """Plan lifecycle and plan request-kind labeling should be explicit in the logs."""
+        logger = self._build_logger(temp_dir)
+        turn_id = logger.start_turn(raw_user_input="/plan start add workflow", normalized_user_input="add workflow")
+
+        logger.log_plan_event(
+            turn_id=None,
+            stage="started",
+            plan_id="plan-1234",
+            status="draft",
+            file_path=".nano-coder/plans/test.md",
+            task="add workflow",
+        )
+        logger.log_llm_request(
+            turn_id=turn_id,
+            iteration=0,
+            provider="openai",
+            model="gpt-4.1",
+            stream=False,
+            request_kind="plan_turn",
+            request_payload={
+                "model": "gpt-4.1",
+                "messages": [{"role": "system", "content": "Plan"}],
+                "stream": False,
+            },
+        )
+        logger.log_llm_response(
+            turn_id=turn_id,
+            iteration=0,
+            provider="openai",
+            model="gpt-4.1",
+            stream=False,
+            request_kind="plan_turn",
+            response_payload={
+                "object": "chat.completion",
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "content": ""}}],
+            },
+            metrics={"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13, "cached_tokens": 0},
+        )
+        logger.log_plan_event(
+            turn_id=turn_id,
+            stage="submitted",
+            plan_id="plan-1234",
+            status="ready_for_review",
+            file_path=".nano-coder/plans/test.md",
+            summary="Plan ready",
+        )
+        logger.close()
+
+        session_dir = next(Path(temp_dir).glob("session-*"))
+        llm_log = (session_dir / "llm.log").read_text()
+        assert "PLAN START" in llm_log
+        assert "PLAN REQUEST" in llm_log
+        assert "Request Kind: plan_turn" in llm_log
+        assert "PLAN RESPONSE" in llm_log
+        assert "PLAN SUBMITTED" in llm_log
+
+        events = [
+            json.loads(line)
+            for line in (session_dir / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        kinds = [event["kind"] for event in events]
+        assert "plan_started" in kinds
+        assert "plan_submitted" in kinds
+
     def test_logs_context_compaction_skipped_block(self, temp_dir):
         """Skipped compaction attempts should be explicit in llm.log and events."""
         logger = self._build_logger(temp_dir)

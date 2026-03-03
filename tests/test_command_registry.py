@@ -155,3 +155,18 @@ def test_builtin_subagent_help_renders_manual():
     text = output.getvalue()
     assert "Command: /subagent" in text
     assert "/subagent run <task>" in text
+
+
+def test_builtin_plan_help_renders_manual():
+    """Built-in /plan help should render the command manual."""
+    registry = CommandRegistry()
+    builtin.register_all(registry)
+    output = io.StringIO()
+    console = create_console(output)
+
+    executed = registry.execute("/plan help", console, {})
+
+    assert executed is True
+    text = output.getvalue()
+    assert "Command: /plan" in text
+    assert "/plan start <task>" in text

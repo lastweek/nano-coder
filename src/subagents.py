@@ -412,6 +412,9 @@ class SubagentManager:
 
         try:
             child_context = Context.create(cwd=str(parent_agent.context.cwd))
+            child_context.session_mode = parent_agent.context.get_session_mode()
+            child_context.current_plan = parent_agent.context.get_current_plan()
+            child_context.active_approved_plan_id = parent_agent.context.active_approved_plan_id
             child_logger = self._create_child_logger(
                 parent_agent,
                 child_context,
@@ -534,7 +537,14 @@ class SubagentManager:
             model=getattr(parent_llm, "model", None),
             base_url=getattr(parent_llm, "base_url", None),
         )
-        child_tools = clone_tool_registry(parent_agent.tools, include_subagent_tool=False)
+        excluded_tools = set()
+        if child_context.get_session_mode() == "plan":
+            excluded_tools.update({"write_plan", "submit_plan"})
+        child_tools = clone_tool_registry(
+            parent_agent.tools,
+            include_subagent_tool=False,
+            exclude_tools=excluded_tools,
+        )
 
         from src.agent import Agent
 

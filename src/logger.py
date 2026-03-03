@@ -15,6 +15,7 @@ from src.config import config
 from src.tools import (
     REQUEST_KIND_AGENT_TURN,
     REQUEST_KIND_CONTEXT_COMPACTION,
+    REQUEST_KIND_PLAN_TURN,
 )
 
 
@@ -280,6 +281,19 @@ class SessionLogger:
             label,
             details,
         )
+
+    def log_plan_event(
+        self,
+        *,
+        turn_id: Optional[int],
+        stage: str,
+        **details: Any,
+    ) -> None:
+        """Log one plan lifecycle event to both session outputs."""
+        if not self.enabled:
+            return
+
+        self._submit_write(self._record_plan_event, turn_id, stage, details)
 
     def log_skill_event(self, turn_id: int, event: str, **details: Any) -> None:
         """Log a skill event to events.jsonl and llm.log."""
@@ -734,6 +748,11 @@ class SessionLogger:
                 f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | "
                 f"CONTEXT COMPACTION REQUEST | STREAM={str(stream).lower()}"
             )
+        elif request_kind == REQUEST_KIND_PLAN_TURN:
+            header = (
+                f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | "
+                f"PLAN REQUEST | STREAM={str(stream).lower()}"
+            )
         else:
             header = (
                 f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | "
@@ -769,6 +788,11 @@ class SessionLogger:
             header = (
                 f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | "
                 f"CONTEXT COMPACTION RESPONSE | STREAM={str(stream).lower()}"
+            )
+        elif request_kind == REQUEST_KIND_PLAN_TURN:
+            header = (
+                f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | ITERATION {iteration + 1:02d} | "
+                f"PLAN RESPONSE | STREAM={str(stream).lower()}"
             )
         else:
             header = (
@@ -860,6 +884,44 @@ class SessionLogger:
                 f"LLM Log: {details.get('llm_log')}",
                 f"Events Log: {details.get('events_log')}",
             ],
+            sections=self._append_json_block("DETAILS", details),
+        )
+
+    def _record_plan_event(
+        self,
+        turn_id: Optional[int],
+        stage: str,
+        details: Dict[str, Any],
+    ) -> None:
+        """Write a plan lifecycle block and structured event."""
+        self._ensure_initialized()
+        timestamp = datetime.now().isoformat()
+        timeline_seq = self._next_timeline_seq()
+        event_kind = f"plan_{stage}"
+        self._append_event(
+            event_kind,
+            timeline_seq,
+            turn_id=turn_id,
+            **details,
+        )
+
+        stage_label = {
+            "started": "PLAN START",
+            "written": "PLAN WRITTEN",
+            "submitted": "PLAN SUBMITTED",
+            "approved": "PLAN APPROVED",
+            "rejected": "PLAN REJECTED",
+            "execution_started": "PLAN EXECUTION START",
+            "cleared": "PLAN CLEARED",
+        }.get(stage, "PLAN EVENT")
+        if turn_id is None:
+            header = f"STEP {timeline_seq:04d} | {stage_label}"
+        else:
+            header = f"STEP {timeline_seq:04d} | TURN {turn_id:04d} | {stage_label}"
+        self._write_timeline_block(
+            rule=SECTION_RULE,
+            header=header,
+            timestamp=timestamp,
             sections=self._append_json_block("DETAILS", details),
         )
 

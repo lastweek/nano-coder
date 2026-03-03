@@ -194,3 +194,25 @@ def test_register_tools_empty_server():
 
         # Should not crash, just no tools registered
         assert len([k for k in registry._tools.keys() if k.startswith("empty:")]) == 0
+
+
+def test_register_tools_reuses_cached_discovery_between_registries():
+    """Repeated registry rebuilds should not re-run MCP tools/list discovery."""
+    mock_server = Mock()
+    mock_server.name = "deepwiki"
+    mock_server.list_tools.return_value = [
+        {"name": "ask_question", "description": "Ask repository questions"},
+        {"name": "read_wiki", "description": "Read wiki pages"},
+    ]
+
+    with patch("src.mcp.MCPServer", return_value=mock_server):
+        manager = MCPManager([{"name": "deepwiki", "url": "http://localhost:3000"}])
+        first_registry = ToolRegistry()
+        second_registry = ToolRegistry()
+
+        manager.register_tools(first_registry)
+        manager.register_tools(second_registry)
+
+        assert "deepwiki:ask_question" in first_registry._tools
+        assert "deepwiki:read_wiki" in second_registry._tools
+        assert mock_server.list_tools.call_count == 1

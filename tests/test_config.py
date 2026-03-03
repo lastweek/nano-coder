@@ -53,6 +53,14 @@ class TestConfigDefaults:
         assert config.subagents.max_per_turn == 6
         assert config.subagents.default_timeout_seconds == 180
 
+    def test_plan_defaults(self, monkeypatch):
+        """Test plan config default values."""
+        monkeypatch.delenv("PLAN_ENABLED", raising=False)
+        config = Config()
+        assert config.plan.enabled is True
+        assert config.plan.plan_dir == ".nano-coder/plans"
+        assert config.plan.allow_subagents is True
+
 
 class TestConfigValidation:
     """Test configuration validation."""
@@ -121,6 +129,7 @@ class TestConfigSingleton:
         assert hasattr(config, 'agent')
         assert hasattr(config, 'ui')
         assert hasattr(config, 'subagents')
+        assert hasattr(config, 'plan')
         assert isinstance(config.llm, LLMConfig)
         assert isinstance(config.logging, LoggingConfig)
 

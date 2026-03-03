@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from threading import Lock
 from time import perf_counter
-from typing import Any, Literal, Optional
+from typing import Literal, Optional
 
 from src.config import config
 from src.context import Context
 from src.llm import LLMClient
-from src.logger import SessionLogger
-from src.tools import REQUEST_KIND_SUBAGENT_TURN
-from src.tool_builder import clone_tool_registry
+from src.logger import SessionLogSnapshot, SessionLogger
+from src.tools import REQUEST_KIND_SUBAGENT_TURN, clone_tool_registry
+from src.turn_activity import TurnActivityEvent
 
 
 def _utc_now() -> str:
@@ -24,9 +24,11 @@ def _utc_now() -> str:
     return datetime.now().isoformat()
 
 
-def _sanitize_label(label: str) -> str:
-    """Convert a label into a filesystem-safe form."""
-    return "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in label.strip()).strip("-") or "subagent"
+def _sanitize_path_fragment(value: str) -> str:
+    """Convert a label into the filesystem-safe fragment used by child session dirs."""
+    sanitized = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in value.strip())
+    sanitized = sanitized.strip("-")
+    return sanitized or "subagent"
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,23 @@ class SubagentResult:
     tools_used: list[str]
     error: str | None = None
 
+    def to_payload(self) -> dict[str, object]:
+        """Serialize the result into the parent tool-result payload."""
+        return {
+            "subagent_id": self.subagent_id,
+            "label": self.label,
+            "status": self.status,
+            "summary": self.summary,
+            "report": self.report,
+            "session_dir": self.session_dir,
+            "llm_log": self.llm_log,
+            "events_log": self.events_log,
+            "llm_call_count": self.llm_call_count,
+            "tool_call_count": self.tool_call_count,
+            "tools_used": self.tools_used,
+            "error": self.error,
+        }
+
 
 @dataclass
 class SubagentRun:
@@ -75,16 +94,16 @@ class SubagentRun:
 
 
 @dataclass(frozen=True)
-class _PreparedSubagent:
-    """Concrete prepared child-agent execution state."""
+class _PreparedSubagentRun:
+    """Main-thread metadata needed before a worker thread launches a child agent."""
 
     request: SubagentRequest
     run: SubagentRun
-    child_agent: Any
     task_message: str
     session_dir: str
     llm_log: str
     events_log: str
+
 
 class SubagentManager:
     """Create and run local child agents with bounded parallel fan-out."""
@@ -97,14 +116,14 @@ class SubagentManager:
         max_per_turn: Optional[int] = None,
         default_timeout_seconds: Optional[int] = None,
     ) -> None:
-        subagent_config = config.subagents
-        self.enabled = subagent_config.enabled if enabled is None else enabled
-        self.max_parallel = subagent_config.max_parallel if max_parallel is None else max_parallel
-        self.max_per_turn = subagent_config.max_per_turn if max_per_turn is None else max_per_turn
+        cfg = config.subagents
+        self.enabled = enabled if enabled is not None else cfg.enabled
+        self.max_parallel = max_parallel if max_parallel is not None else cfg.max_parallel
+        self.max_per_turn = max_per_turn if max_per_turn is not None else cfg.max_per_turn
         self.default_timeout_seconds = (
-            subagent_config.default_timeout_seconds
-            if default_timeout_seconds is None
-            else default_timeout_seconds
+            default_timeout_seconds
+            if default_timeout_seconds is not None
+            else cfg.default_timeout_seconds
         )
 
         self._lock = Lock()
@@ -123,14 +142,18 @@ class SubagentManager:
         with self._lock:
             return self._runs_by_id.get(subagent_id)
 
-    def build_request(self, arguments: dict[str, Any]) -> SubagentRequest:
+    def build_subagent_request(self, arguments: dict[str, object]) -> SubagentRequest:
         """Normalize tool-call arguments into a subagent request."""
         task = str(arguments.get("task", "")).strip()
         if not task:
             raise ValueError("task is required")
 
         raw_files = arguments.get("files") or []
-        files = [str(item) for item in raw_files if str(item).strip()] if isinstance(raw_files, list) else []
+        files = (
+            [str(item) for item in raw_files if str(item).strip()]
+            if isinstance(raw_files, list)
+            else []
+        )
         return SubagentRequest(
             task=task,
             label=str(arguments.get("label", "")).strip(),
@@ -140,122 +163,57 @@ class SubagentManager:
             output_hint=str(arguments.get("output_hint", "")).strip(),
         )
 
-    def run_one(
-        self,
-        parent_agent,
-        request: SubagentRequest,
-        *,
-        parent_turn_id: int | None,
-        iteration: int,
-        on_event=None,
-    ) -> SubagentResult:
-        """Run one child agent synchronously."""
-        if not self.enabled:
-            return self._disabled_result(request)
-
-        allowance = self._reserve_turn_slots(parent_agent, parent_turn_id, requested=1)
-        if allowance < 1:
-            return self._limit_result(request, "Subagent per-turn limit reached")
-
-        prepared = self._prepare_run(parent_agent, request, parent_turn_id)
-        self._log_subagent_started(parent_agent, prepared, parent_turn_id, on_event)
-
-        started_at = perf_counter()
-        try:
-            result = self._execute_prepared(prepared)
-        except Exception as exc:
-            result = self._failure_result(prepared, f"Subagent failed: {exc}")
-
-        result = self._finalize_run(prepared.run, result, perf_counter() - started_at)
-        self._log_subagent_finished(parent_agent, result, parent_turn_id, on_event)
-        return result
-
-    def run_batch(
+    def run_subagents(
         self,
         parent_agent,
         requests: list[SubagentRequest],
         *,
         parent_turn_id: int | None,
-        iteration: int,
         on_event=None,
     ) -> list[SubagentResult]:
-        """Run multiple child agents with bounded parallel fan-out."""
+        """Run one or many subagents through the same worker-thread path."""
         if not requests:
-            return []
-
+            raise ValueError("run_subagents requires at least one request")
         if not self.enabled:
-            return [self._disabled_result(request) for request in requests]
+            return [self._build_disabled_result(request) for request in requests]
 
-        allowance = self._reserve_turn_slots(parent_agent, parent_turn_id, requested=len(requests))
-        allowed_requests = requests[:allowance]
-        overflow_requests = requests[allowance:]
+        allowed_count = self._reserve_turn_capacity(
+            parent_agent,
+            parent_turn_id,
+            requested=len(requests),
+        )
+        allowed_requests = requests[:allowed_count]
+        rejected_requests = requests[allowed_count:]
 
-        prepared_items = [
-            self._prepare_run(parent_agent, request, parent_turn_id)
+        prepared_subagent_runs = [
+            self._create_prepared_subagent_run(parent_agent, request, parent_turn_id)
             for request in allowed_requests
         ]
-        for prepared in prepared_items:
-            self._log_subagent_started(parent_agent, prepared, parent_turn_id, on_event)
-
-        results_by_id: dict[str, SubagentResult] = {}
-        future_map: dict[Any, tuple[_PreparedSubagent, float]] = {}
-        executor = ThreadPoolExecutor(max_workers=self.max_parallel, thread_name_prefix="subagent")
-        try:
-            for prepared in prepared_items:
-                started_at = perf_counter()
-                future = executor.submit(self._execute_prepared, prepared)
-                future_map[future] = (prepared, started_at)
-
-            for future, (prepared, started_at) in future_map.items():
-                try:
-                    raw_result = future.result(timeout=self.default_timeout_seconds)
-                except TimeoutError:
-                    future.cancel()
-                    raw_result = self._timed_out_result(prepared, self.default_timeout_seconds)
-                except Exception as exc:
-                    raw_result = self._failure_result(prepared, f"Subagent failed: {exc}")
-
-                finalized = self._finalize_run(
-                    prepared.run,
-                    raw_result,
-                    perf_counter() - started_at,
-                )
-                results_by_id[prepared.run.subagent_id] = finalized
-                self._log_subagent_finished(parent_agent, finalized, parent_turn_id, on_event)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=False)
-
-        ordered_results = [results_by_id[prepared.run.subagent_id] for prepared in prepared_items]
-        ordered_results.extend(
-            self._limit_result(
+        results = self._run_prepared_subagents(
+            parent_agent,
+            prepared_subagent_runs,
+            parent_turn_id=parent_turn_id,
+            on_event=on_event,
+        )
+        results.extend(
+            self._build_rejected_result(
                 request,
                 (
                     "Subagent request rejected because this turn exceeded the configured "
                     f"max_per_turn={self.max_per_turn}"
                 ),
             )
-            for request in overflow_requests
+            for request in rejected_requests
         )
-        return ordered_results
+        return results
 
-    def result_to_payload(self, result: SubagentResult) -> dict[str, Any]:
-        """Convert a result into the parent tool-result payload."""
-        return {
-            "subagent_id": result.subagent_id,
-            "label": result.label,
-            "status": result.status,
-            "summary": result.summary,
-            "report": result.report,
-            "session_dir": result.session_dir,
-            "llm_log": result.llm_log,
-            "events_log": result.events_log,
-            "llm_call_count": result.llm_call_count,
-            "tool_call_count": result.tool_call_count,
-            "tools_used": result.tools_used,
-            "error": result.error,
-        }
-
-    def _reserve_turn_slots(self, parent_agent, parent_turn_id: int | None, *, requested: int) -> int:
+    def _reserve_turn_capacity(
+        self,
+        parent_agent,
+        parent_turn_id: int | None,
+        *,
+        requested: int,
+    ) -> int:
         """Reserve the remaining per-turn capacity for subagent runs."""
         if parent_turn_id is None:
             return min(requested, self.max_per_turn)
@@ -264,18 +222,61 @@ class SubagentManager:
         with self._lock:
             used = self._per_turn_counts.get(key, 0)
             remaining = max(self.max_per_turn - used, 0)
-            allowance = min(requested, remaining)
-            self._per_turn_counts[key] = used + allowance
-            return allowance
+            allowed_count = min(requested, remaining)
+            self._per_turn_counts[key] = used + allowed_count
+            return allowed_count
 
-    def _prepare_run(self, parent_agent, request: SubagentRequest, parent_turn_id: int | None) -> _PreparedSubagent:
-        """Create the child agent and log paths for one prepared run."""
-        subagent_id, label = self._allocate_identity(request.label)
+    def _create_prepared_subagent_run(
+        self,
+        parent_agent,
+        request: SubagentRequest,
+        parent_turn_id: int | None,
+    ) -> _PreparedSubagentRun:
+        """Create the stable run record and predictable child log paths for one subagent."""
+        subagent_id, label = self._create_subagent_identity(request.label)
+        run = self._create_subagent_run_record(
+            subagent_id=subagent_id,
+            label=label,
+            task=request.task,
+            parent_turn_id=parent_turn_id,
+        )
+        session_dir, llm_log, events_log = self._build_child_log_paths(
+            parent_agent,
+            subagent_id=subagent_id,
+            label=label,
+        )
+        return _PreparedSubagentRun(
+            request=request,
+            run=run,
+            task_message=self._build_subagent_task_message(request),
+            session_dir=session_dir,
+            llm_log=llm_log,
+            events_log=events_log,
+        )
+
+    def _create_subagent_identity(self, requested_label: str) -> tuple[str, str]:
+        """Create a stable run id and display label."""
+        with self._lock:
+            self._run_counter += 1
+            index = self._run_counter
+        label = requested_label.strip() or f"subagent-{index:03d}"
+        subagent_id = f"sa_{index:04d}_{uuid.uuid4().hex[:8]}"
+        return subagent_id, label
+
+    def _create_subagent_run_record(
+        self,
+        *,
+        subagent_id: str,
+        label: str,
+        task: str,
+        parent_turn_id: int | None,
+    ) -> SubagentRun:
+        """Create and store the session-tracked record for one subagent run."""
         run = SubagentRun(
             subagent_id=subagent_id,
             parent_turn_id=parent_turn_id,
             label=label,
-            task=request.task,
+            task=task,
             status="running",
             started_at=_utc_now(),
             ended_at=None,
@@ -285,8 +286,186 @@ class SubagentManager:
         with self._lock:
             self._runs.append(run)
             self._runs_by_id[subagent_id] = run
+        return run
 
-        child_context = Context.create(cwd=str(parent_agent.context.cwd))
+    def _build_child_log_paths(
+        self,
+        parent_agent,
+        *,
+        subagent_id: str,
+        label: str,
+    ) -> tuple[str, str, str]:
+        """Predict the nested child log paths before the worker thread creates its logger."""
+        parent_session_dir = parent_agent.logger.ensure_session_dir()
+        label_fragment = _sanitize_path_fragment(label)
+        id_fragment = _sanitize_path_fragment(subagent_id[:8])
+        session_dir = (
+            Path(parent_session_dir)
+            / "subagents"
+            / f"subagent-{label_fragment}-{id_fragment}"
+        )
+        return (
+            str(session_dir),
+            str(session_dir / "llm.log"),
+            str(session_dir / "events.jsonl"),
+        )
+
+    def _build_subagent_task_message(self, request: SubagentRequest) -> str:
+        """Render the delegated first user message for a child agent."""
+        lines = [
+            "You are a delegated subagent working inside the same repository as the parent agent.",
+            "Work from this task brief only. Inspect files and use tools yourself rather than assuming parent context.",
+            "",
+            "Task:",
+            request.task,
+        ]
+        if request.context:
+            lines += ["", "Context from parent:", request.context]
+        if request.files:
+            lines += ["", "Relevant files:"] + [f"- {path}" for path in request.files]
+        if request.success_criteria:
+            lines += ["", "Success criteria:", request.success_criteria]
+        if request.output_hint:
+            lines += ["", "Output hint:", request.output_hint]
+        lines += ["", "Return a concise report. Put the executive summary in the first paragraph."]
+        return "\n".join(lines)
+
+    def _run_prepared_subagents(
+        self,
+        parent_agent,
+        prepared_subagent_runs: list[_PreparedSubagentRun],
+        *,
+        parent_turn_id: int | None,
+        on_event,
+    ) -> list[SubagentResult]:
+        """Run prepared subagents in worker threads and return results in input order."""
+        if not prepared_subagent_runs:
+            return []
+
+        for prepared_subagent_run in prepared_subagent_runs:
+            self._log_subagent_started(
+                parent_agent,
+                prepared_subagent_run,
+                parent_turn_id=parent_turn_id,
+                on_event=on_event,
+            )
+
+        results_by_id: dict[str, SubagentResult] = {}
+        future_map: dict[object, tuple[_PreparedSubagentRun, float]] = {}
+
+        max_workers = min(self.max_parallel, max(len(prepared_subagent_runs), 1))
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="subagent",
+        ) as executor:
+            for prepared_subagent_run in prepared_subagent_runs:
+                started_at = perf_counter()
+                future = executor.submit(
+                    self._run_subagent_in_thread,
+                    parent_agent,
+                    prepared_subagent_run,
+                    parent_turn_id,
+                )
+                future_map[future] = (prepared_subagent_run, started_at)
+
+            for future, (prepared_subagent_run, started_at) in future_map.items():
+                try:
+                    result = future.result(timeout=self.default_timeout_seconds)
+                except TimeoutError:
+                    future.cancel()
+                    result = self._build_timed_out_result(
+                        prepared_subagent_run,
+                        timeout_seconds=self.default_timeout_seconds,
+                    )
+                except Exception as exc:
+                    result = self._build_failed_result(
+                        prepared_subagent_run,
+                        f"Subagent failed: {exc}",
+                    )
+
+                finalized_result = self._finalize_subagent_run_record(
+                    prepared_subagent_run.run,
+                    result,
+                    duration_s=perf_counter() - started_at,
+                )
+                self._log_subagent_finished(
+                    parent_agent,
+                    finalized_result,
+                    parent_turn_id=parent_turn_id,
+                    on_event=on_event,
+                )
+                results_by_id[prepared_subagent_run.run.subagent_id] = finalized_result
+
+        return [
+            results_by_id[prepared_subagent_run.run.subagent_id]
+            for prepared_subagent_run in prepared_subagent_runs
+        ]
+
+    def _run_subagent_in_thread(
+        self,
+        parent_agent,
+        prepared_subagent_run: _PreparedSubagentRun,
+        parent_turn_id: int | None,
+    ) -> SubagentResult:
+        """Build the child runtime inside the worker thread and return its result."""
+        child_logger: SessionLogger | None = None
+
+        try:
+            child_context = Context.create(cwd=str(parent_agent.context.cwd))
+            child_logger = self._create_child_logger(
+                parent_agent,
+                child_context,
+                subagent_id=prepared_subagent_run.run.subagent_id,
+                label=prepared_subagent_run.run.label,
+                parent_turn_id=parent_turn_id,
+            )
+            child_agent = self._create_child_agent(parent_agent, child_context, child_logger)
+            report = child_agent.run(prepared_subagent_run.task_message)
+        except Exception as exc:
+            snapshot = self._close_child_logger(
+                child_logger,
+                status="error",
+            )
+            return self._build_failed_result(
+                prepared_subagent_run,
+                str(exc),
+                snapshot=snapshot,
+            )
+
+        snapshot = self._close_child_logger(
+            child_logger,
+            status="completed",
+        )
+        return self._build_subagent_result(
+            prepared_subagent_run,
+            snapshot=snapshot,
+            status="completed",
+            summary=self._extract_summary(report),
+            report=report,
+        )
+
+    def _close_child_logger(
+        self,
+        child_logger: SessionLogger | None,
+        *,
+        status: str,
+    ) -> SessionLogSnapshot | None:
+        """Close a child logger if it exists and return its in-memory snapshot."""
+        if child_logger is None:
+            return None
+        child_logger.close(status=status)
+        return child_logger.get_session_snapshot()
+
+    def _create_child_logger(
+        self,
+        parent_agent,
+        child_context: Context,
+        *,
+        subagent_id: str,
+        label: str,
+        parent_turn_id: int | None,
+    ) -> SessionLogger:
+        """Create the nested logger used by one child agent."""
         parent_session_dir = parent_agent.logger.ensure_session_dir()
         child_log_dir = parent_session_dir / "subagents"
         child_logger = SessionLogger(
@@ -301,25 +480,35 @@ class SubagentManager:
             subagent_id=subagent_id,
             subagent_label=label,
         )
+        parent_llm = parent_agent.llm
         child_logger.start_session(
             cwd=str(child_context.cwd),
-            provider=getattr(parent_agent.llm, "provider", "unknown"),
-            model=getattr(parent_agent.llm, "model", "unknown"),
-            base_url=getattr(parent_agent.llm, "base_url", None),
+            provider=getattr(parent_llm, "provider", "unknown"),
+            model=getattr(parent_llm, "model", "unknown"),
+            base_url=getattr(parent_llm, "base_url", None),
             streaming_enabled=False,
         )
         child_logger.ensure_session_dir()
+        return child_logger
 
+    def _create_child_agent(
+        self,
+        parent_agent,
+        child_context: Context,
+        child_logger: SessionLogger,
+    ):
+        """Create a fresh child agent with inherited normal tools and a fresh context."""
+        parent_llm = parent_agent.llm
         child_llm = LLMClient(
-            provider=getattr(parent_agent.llm, "provider", None),
-            model=getattr(parent_agent.llm, "model", None),
-            base_url=getattr(parent_agent.llm, "base_url", None),
+            provider=getattr(parent_llm, "provider", None),
+            model=getattr(parent_llm, "model", None),
+            base_url=getattr(parent_llm, "base_url", None),
         )
         child_tools = clone_tool_registry(parent_agent.tools, include_subagent_tool=False)
 
         from src.agent import Agent
 
-        child_agent = Agent(
+        return Agent(
             child_llm,
             child_tools,
             child_context,
@@ -327,160 +516,63 @@ class SubagentManager:
             logger=child_logger,
             request_kind=REQUEST_KIND_SUBAGENT_TURN,
         )
-        task_message = self._build_task_message(request)
 
-        session_dir = str(child_logger.session_dir)
-        llm_log = str(child_logger.get_llm_log_path())
-        events_log = str(child_logger.get_events_path())
-        return _PreparedSubagent(
-            request=request,
-            run=run,
-            child_agent=child_agent,
-            task_message=task_message,
-            session_dir=session_dir,
-            llm_log=llm_log,
-            events_log=events_log,
-        )
-
-    def _allocate_identity(self, requested_label: str) -> tuple[str, str]:
-        """Allocate a stable run id and display label."""
-        with self._lock:
-            self._run_counter += 1
-            index = self._run_counter
-        label = requested_label.strip() or f"subagent-{index:03d}"
-        subagent_id = f"sa_{index:04d}_{uuid.uuid4().hex[:8]}"
-        return subagent_id, label
-
-    def _build_task_message(self, request: SubagentRequest) -> str:
-        """Render the child agent's delegated first user message."""
-        lines = [
-            "You are a delegated subagent working inside the same repository as the parent agent.",
-            "Work from this task brief only. Inspect files and use tools yourself rather than assuming parent context.",
-            "",
-            "Task:",
-            request.task,
-        ]
-        if request.context:
-            lines.extend(["", "Context from parent:", request.context])
-        if request.files:
-            lines.extend(["", "Relevant files:"])
-            lines.extend(f"- {path}" for path in request.files)
-        if request.success_criteria:
-            lines.extend(["", "Success criteria:", request.success_criteria])
-        if request.output_hint:
-            lines.extend(["", "Output hint:", request.output_hint])
-        lines.extend([
-            "",
-            "Return a concise report. Put the executive summary in the first paragraph.",
-        ])
-        return "\n".join(lines)
-
-    def _execute_prepared(self, prepared: _PreparedSubagent) -> SubagentResult:
-        """Execute one prepared child agent synchronously."""
-        try:
-            report = prepared.child_agent.run(prepared.task_message)
-            status: Literal["completed", "failed", "timed_out"] = "completed"
-            error = None
-        except Exception as exc:
-            report = ""
-            status = "failed"
-            error = str(exc)
-        finally:
-            prepared.child_agent.logger.close(status="completed" if status == "completed" else "error")
-
-        if status != "completed":
-            return self._failure_result(prepared, error or "Subagent failed")
-
-        session_data = self._read_child_session_data(prepared)
-        return SubagentResult(
-            subagent_id=prepared.run.subagent_id,
-            label=prepared.run.label,
-            status="completed",
-            summary=self._extract_summary(report),
-            report=report,
-            session_dir=prepared.session_dir,
-            llm_log=prepared.llm_log,
-            events_log=prepared.events_log,
-            llm_call_count=session_data["llm_call_count"],
-            tool_call_count=session_data["tool_call_count"],
-            tools_used=session_data["tools_used"],
-            error=None,
-        )
-
-    def _read_child_session_data(self, prepared: _PreparedSubagent) -> dict[str, Any]:
-        """Read child session aggregates after the logger closes."""
-        session_path = prepared.child_agent.logger.session_dir / "session.json"
-        events_path = prepared.child_agent.logger.session_dir / "events.jsonl"
-
-        llm_call_count = 0
-        tool_call_count = 0
-        tools_used: list[str] = []
-
-        if session_path.exists():
-            session_json = json.loads(session_path.read_text(encoding="utf-8"))
-            llm_call_count = int(session_json.get("llm_call_count", 0))
-            tool_call_count = int(session_json.get("tool_call_count", 0))
-
-        if events_path.exists():
-            for line in events_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                if event.get("kind") == "turn_completed":
-                    tools_used = [str(name) for name in event.get("tools_used", [])]
-
-        return {
-            "llm_call_count": llm_call_count,
-            "tool_call_count": tool_call_count,
-            "tools_used": tools_used,
-        }
-
-    def _finalize_run(
+    def _finalize_subagent_run_record(
         self,
         run: SubagentRun,
         result: SubagentResult,
+        *,
         duration_s: float | None,
     ) -> SubagentResult:
-        """Persist run status in-memory and return the finalized result."""
-        finalized = SubagentResult(
-            **{
-                **result.__dict__,
-            }
-        )
+        """Store final run metadata in memory and return the finalized result."""
         with self._lock:
-            run.status = finalized.status
+            run.status = result.status
             run.ended_at = _utc_now()
             run.duration_s = duration_s
-            run.result = finalized
-        return finalized
+            run.result = result
+        return result
 
-    def _log_subagent_started(self, parent_agent, prepared: _PreparedSubagent, parent_turn_id: int | None, on_event) -> None:
+    def _log_subagent_started(
+        self,
+        parent_agent,
+        prepared_subagent_run: _PreparedSubagentRun,
+        *,
+        parent_turn_id: int | None,
+        on_event,
+    ) -> None:
         """Record a parent-visible subagent start event."""
         parent_agent.logger.log_subagent_event(
             turn_id=parent_turn_id,
             stage="started",
-            subagent_id=prepared.run.subagent_id,
-            label=prepared.run.label,
-            task=prepared.request.task,
-            session_dir=prepared.session_dir,
-            llm_log=prepared.llm_log,
-            events_log=prepared.events_log,
+            subagent_id=prepared_subagent_run.run.subagent_id,
+            label=prepared_subagent_run.run.label,
+            task=prepared_subagent_run.request.task,
+            session_dir=prepared_subagent_run.session_dir,
+            llm_log=prepared_subagent_run.llm_log,
+            events_log=prepared_subagent_run.events_log,
         )
-        if on_event is not None:
-            from src.turn_activity import TurnActivityEvent
+        if on_event is None:
+            return
 
-            on_event(
-                TurnActivityEvent(
-                    kind="subagent_started",
-                    details={
-                        "subagent_id": prepared.run.subagent_id,
-                        "label": prepared.run.label,
-                        "task": prepared.request.task,
-                    },
-                )
+        on_event(
+            TurnActivityEvent(
+                kind="subagent_started",
+                details={
+                    "subagent_id": prepared_subagent_run.run.subagent_id,
+                    "label": prepared_subagent_run.run.label,
+                    "task": prepared_subagent_run.request.task,
+                },
             )
+        )
 
-    def _log_subagent_finished(self, parent_agent, result: SubagentResult, parent_turn_id: int | None, on_event) -> None:
+    def _log_subagent_finished(
+        self,
+        parent_agent,
+        result: SubagentResult,
+        *,
+        parent_turn_id: int | None,
+        on_event,
+    ) -> None:
         """Record a parent-visible subagent completion or failure event."""
         stage = "completed" if result.status == "completed" else "failed"
         parent_agent.logger.log_subagent_event(
@@ -495,51 +587,76 @@ class SubagentManager:
             error=result.error,
             status=result.status,
         )
-        if on_event is not None:
-            from src.turn_activity import TurnActivityEvent
+        if on_event is None:
+            return
 
-            if result.status == "completed":
-                on_event(
-                    TurnActivityEvent(
-                        kind="subagent_completed",
-                        details={
-                            "subagent_id": result.subagent_id,
-                            "label": result.label,
-                            "duration_s": self.get_run(result.subagent_id).duration_s or 0.0,
-                            "summary": result.summary,
-                        },
-                    )
+        run = self.get_run(result.subagent_id)
+        duration_s = run.duration_s if run is not None and run.duration_s is not None else 0.0
+        if result.status == "completed":
+            on_event(
+                TurnActivityEvent(
+                    kind="subagent_completed",
+                    details={
+                        "subagent_id": result.subagent_id,
+                        "label": result.label,
+                        "duration_s": duration_s,
+                        "summary": result.summary,
+                    },
                 )
-            else:
-                on_event(
-                    TurnActivityEvent(
-                        kind="subagent_failed",
-                        details={
-                            "subagent_id": result.subagent_id,
-                            "label": result.label,
-                            "duration_s": self.get_run(result.subagent_id).duration_s or 0.0,
-                            "error": result.error or "Subagent failed",
-                        },
-                    )
-                )
+            )
+            return
+
+        on_event(
+            TurnActivityEvent(
+                kind="subagent_failed",
+                details={
+                    "subagent_id": result.subagent_id,
+                    "label": result.label,
+                    "duration_s": duration_s,
+                    "error": result.error or "Subagent failed",
+                },
+            )
+        )
 
     def _extract_summary(self, report: str) -> str:
         """Derive a concise executive summary from a child report."""
         paragraphs = [paragraph.strip() for paragraph in report.split("\n\n") if paragraph.strip()]
-        if paragraphs:
-            summary = " ".join(paragraphs[0].split())
-        else:
-            summary = " ".join(report.split())
+        summary = " ".join(paragraphs[0].split()) if paragraphs else " ".join(report.split())
         if len(summary) > 240:
             summary = summary[:237].rstrip() + "..."
         return summary
 
-    def _disabled_result(self, request: SubagentRequest) -> SubagentResult:
+    def _build_subagent_result(
+        self,
+        prepared_subagent_run: _PreparedSubagentRun,
+        *,
+        snapshot: SessionLogSnapshot | None,
+        status: Literal["completed", "failed", "timed_out"],
+        summary: str,
+        report: str = "",
+        error: str | None = None,
+    ) -> SubagentResult:
+        """Build a structured subagent result from a logger snapshot."""
+        return SubagentResult(
+            subagent_id=prepared_subagent_run.run.subagent_id,
+            label=prepared_subagent_run.run.label,
+            status=status,
+            summary=summary,
+            report=report,
+            session_dir=snapshot.session_dir if snapshot is not None else prepared_subagent_run.session_dir,
+            llm_log=snapshot.llm_log if snapshot is not None else prepared_subagent_run.llm_log,
+            events_log=snapshot.events_log if snapshot is not None else prepared_subagent_run.events_log,
+            llm_call_count=snapshot.llm_call_count if snapshot is not None else 0,
+            tool_call_count=snapshot.tool_call_count if snapshot is not None else 0,
+            tools_used=snapshot.tools_used if snapshot is not None else [],
+            error=error,
+        )
+
+    def _build_disabled_result(self, request: SubagentRequest) -> SubagentResult:
         """Return a structured failure when subagents are disabled."""
-        label = request.label or "subagent"
         return SubagentResult(
             subagent_id="disabled",
-            label=label,
+            label=request.label or "subagent",
             status="failed",
             summary="Subagents are disabled.",
             report="",
@@ -552,7 +669,7 @@ class SubagentManager:
             error="Subagents are disabled in the current configuration",
         )
 
-    def _limit_result(self, request: SubagentRequest, message: str) -> SubagentResult:
+    def _build_rejected_result(self, request: SubagentRequest, message: str) -> SubagentResult:
         """Return a structured failure when the per-turn limit is exceeded."""
         return SubagentResult(
             subagent_id=f"rejected_{uuid.uuid4().hex[:8]}",
@@ -569,39 +686,34 @@ class SubagentManager:
             error=message,
         )
 
-    def _failure_result(self, prepared: _PreparedSubagent, message: str) -> SubagentResult:
+    def _build_failed_result(
+        self,
+        prepared_subagent_run: _PreparedSubagentRun,
+        message: str,
+        *,
+        snapshot: SessionLogSnapshot | None = None,
+    ) -> SubagentResult:
         """Return a structured failure tied to a prepared child run."""
-        session_data = self._read_child_session_data(prepared)
-        return SubagentResult(
-            subagent_id=prepared.run.subagent_id,
-            label=prepared.run.label,
+        return self._build_subagent_result(
+            prepared_subagent_run,
+            snapshot=snapshot,
             status="failed",
             summary=f"Subagent failed: {message}",
-            report="",
-            session_dir=prepared.session_dir,
-            llm_log=prepared.llm_log,
-            events_log=prepared.events_log,
-            llm_call_count=session_data["llm_call_count"],
-            tool_call_count=session_data["tool_call_count"],
-            tools_used=session_data["tools_used"],
             error=message,
         )
 
-    def _timed_out_result(self, prepared: _PreparedSubagent, timeout_seconds: int) -> SubagentResult:
+    def _build_timed_out_result(
+        self,
+        prepared_subagent_run: _PreparedSubagentRun,
+        *,
+        timeout_seconds: int,
+    ) -> SubagentResult:
         """Return a structured timeout result."""
-        session_data = self._read_child_session_data(prepared)
         message = f"Subagent timed out after {timeout_seconds} seconds"
-        return SubagentResult(
-            subagent_id=prepared.run.subagent_id,
-            label=prepared.run.label,
+        return self._build_subagent_result(
+            prepared_subagent_run,
+            snapshot=None,
             status="timed_out",
             summary=message,
-            report="",
-            session_dir=prepared.session_dir,
-            llm_log=prepared.llm_log,
-            events_log=prepared.events_log,
-            llm_call_count=session_data["llm_call_count"],
-            tool_call_count=session_data["tool_call_count"],
-            tools_used=session_data["tools_used"],
             error=message,
         )

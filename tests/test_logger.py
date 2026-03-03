@@ -126,6 +126,41 @@ class TestSessionLogger:
         assert "STEP 0005 | TURN 0001 | TURN END" in llm_log
         assert "STEP 0006 | SESSION END" in llm_log
 
+    def test_get_session_snapshot_returns_in_memory_aggregates(self, temp_dir):
+        """The logger snapshot should expose current session aggregates without file parsing."""
+        logger = self._build_logger(temp_dir)
+        turn_id = logger.start_turn(raw_user_input="hello", normalized_user_input="hello")
+        logger.log_llm_request(
+            turn_id=turn_id,
+            iteration=0,
+            provider="openai",
+            model="gpt-4.1",
+            stream=False,
+            request_payload={
+                "model": "gpt-4.1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+        logger.log_tool_call(
+            turn_id=turn_id,
+            iteration=0,
+            tool_name="read_file",
+            arguments={"file_path": "README.md"},
+            tool_call_id="call_1",
+        )
+        logger.finish_turn(turn_id, "done", [], status="completed")
+
+        snapshot = logger.get_session_snapshot()
+        logger.close()
+
+        assert snapshot.session_dir.endswith(logger.session_dir.name)
+        assert snapshot.llm_log.endswith("llm.log")
+        assert snapshot.events_log.endswith("events.jsonl")
+        assert snapshot.llm_call_count == 1
+        assert snapshot.tool_call_count == 1
+        assert snapshot.tools_used == ["read_file"]
+
     def test_logs_structured_events_and_spills_large_payloads(self, temp_dir):
         """Tool and skill events should be inline in llm.log and structured in events."""
         logger = self._build_logger(temp_dir)

@@ -1,17 +1,49 @@
 """Agent orchestration for Nano-Coder."""
 
+from dataclasses import dataclass
 import json
 from time import perf_counter
-from typing import Callable, Optional, List, Dict, Tuple, Any
+from typing import Callable, Optional, List, Dict, Tuple, Any, Literal
 from src.tools import (
     ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL,
-    REQUEST_KIND_AGENT_TURN, REQUEST_KIND_CONTEXT_COMPACTION
+    REQUEST_KIND_AGENT_TURN,
 )
 from src.logger import SessionLogger
 from src.metrics import LLMMetrics
-from src.config import Config, config
+from src.config import Config
 from src.context_compaction import ContextCompactionManager, ContextCompactionPolicy
 from src.turn_activity import TurnActivityCallback, TurnActivityEvent
+
+
+@dataclass(frozen=True)
+class _SubagentToolCallResolution:
+    """One resolved run_subagent tool call in original batch order."""
+
+    tool_call_id: str
+    request: Any | None = None
+    error_payload: Dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _ModelIterationResult:
+    """Outcome of one model iteration inside the shared turn loop."""
+
+    outcome: Literal["final_answer", "tool_calls"]
+    assistant_text: str
+    requested_tool_calls: List[Dict[str, Any]]
+
+
+@dataclass
+class _AgentTurnState:
+    """Mutable state tracked across one top-level agent turn."""
+
+    turn_id: int
+    normalized_user_message: str
+    conversation_messages: List[Dict[str, Any]]
+    tools_used: List[str]
+    skills_used: List[str]
+    tool_call_count: int = 0
+    is_finished: bool = False
 
 
 class Agent:
@@ -100,7 +132,7 @@ Be concise and helpful."""
         """Set an optional callback for skill debug events."""
         self._skill_event_callback = callback
 
-    def _get_system_message(self) -> Dict:
+    def _build_system_message(self) -> Dict:
         """Build the system message for the current turn."""
         return {"role": ROLE_SYSTEM, "content": self._build_system_prompt()}
 
@@ -178,7 +210,7 @@ Be concise and helpful."""
             elif event_name == "normalized_user_message":
                 self._emit_turn_event(on_event, "skill_normalized", **details)
 
-    def _metrics_event_details(self, metrics: Any) -> Dict[str, Any]:
+    def _build_metrics_event_details(self, metrics: Any) -> Dict[str, Any]:
         """Normalize metric fields for activity events."""
         return {
             "duration_s": getattr(metrics, "duration", 0.0),
@@ -188,7 +220,55 @@ Be concise and helpful."""
             "cached_tokens": getattr(metrics, "cached_tokens", 0),
         }
 
-    def _record_prompt_metrics(self, metrics: Any) -> None:
+    def _build_llm_log_context(self, turn_id: int, iteration: int, *, stream: bool) -> Dict[str, Any]:
+        """Build the shared LLM logging context for one request."""
+        return {
+            "turn_id": turn_id,
+            "iteration": iteration,
+            "stream": stream,
+            "request_kind": self.request_kind,
+        }
+
+    def _emit_llm_call_started(
+        self,
+        on_event: Optional[TurnActivityCallback],
+        *,
+        iteration: int,
+        stream: bool,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Emit the live event for an outgoing LLM request."""
+        self._emit_turn_event(
+            on_event,
+            "llm_call_started",
+            iteration=iteration,
+            stream=stream,
+            message_count=len(messages),
+            tool_schema_count=len(self._cached_tool_schemas),
+        )
+
+    def _emit_llm_call_finished(
+        self,
+        on_event: Optional[TurnActivityCallback],
+        *,
+        iteration: int,
+        stream: bool,
+        metrics: Any,
+        tool_calls: List[Dict[str, Any]],
+    ) -> None:
+        """Emit the live event for a completed LLM request."""
+        self._emit_turn_event(
+            on_event,
+            "llm_call_finished",
+            iteration=iteration,
+            stream=stream,
+            **self._build_metrics_event_details(metrics),
+            has_tool_calls=bool(tool_calls),
+            tool_call_count=len(tool_calls),
+            result_kind="tool_calls" if tool_calls else "final_answer",
+        )
+
+    def _store_recent_prompt_metrics(self, metrics: Any) -> None:
         """Persist the most recent prompt usage for compaction decisions."""
         prompt_tokens = getattr(metrics, "prompt_tokens", None)
         if isinstance(prompt_tokens, int) and prompt_tokens > 0:
@@ -202,21 +282,21 @@ Be concise and helpful."""
             self.context.last_prompt_cached_tokens = None
         self.context.last_context_window = Config.load().llm.context_window
 
-    def _initialize_turn(
+    def _create_turn_state(
         self,
         user_message: str,
         on_event: Optional[TurnActivityCallback] = None,
-    ) -> Tuple[int, List[str], List[str], List[Dict[str, Any]], str]:
-        """Initialize a new turn with message building and logging.
+    ) -> _AgentTurnState:
+        """Create the mutable state object for one top-level agent turn.
 
         Args:
             user_message: The user's input message
             on_event: Optional callback for events
 
         Returns:
-            Tuple of (turn_id, tools_used list, skills_used list, normalized_user_message)
+            Mutable turn state shared by the main agent loop.
         """
-        normalized_user_message, preload_skill_names, pending_skill_events = self._prepare_turn_inputs(user_message)
+        normalized_user_message, preload_skill_names, pending_skill_events = self._prepare_user_message_for_turn(user_message)
         turn_id = self.logger.start_turn(
             raw_user_input=user_message,
             normalized_user_input=normalized_user_message,
@@ -229,12 +309,21 @@ Be concise and helpful."""
         if self._cached_tool_schemas is None:
             self._cached_tool_schemas = self.tools.get_tool_schemas()
 
-        self._maybe_auto_compact(turn_id, on_event)
-        messages = self._build_messages(normalized_user_message, preload_skill_names)
+        self._run_auto_compaction_if_needed(turn_id, on_event)
+        conversation_messages = self._build_conversation_messages(
+            normalized_user_message,
+            preload_skill_names,
+        )
 
-        return turn_id, tools_used, skills_used, messages, normalized_user_message
+        return _AgentTurnState(
+            turn_id=turn_id,
+            normalized_user_message=normalized_user_message,
+            conversation_messages=conversation_messages,
+            tools_used=tools_used,
+            skills_used=skills_used,
+        )
 
-    def _prepare_turn_inputs(
+    def _prepare_user_message_for_turn(
         self,
         user_message: str,
     ) -> Tuple[str, List[str], List[Tuple[str, Dict[str, Any]]]]:
@@ -301,9 +390,13 @@ Be concise and helpful."""
 
         return normalized_user_message, preload_skill_names, pending_skill_events
 
-    def _build_messages(self, normalized_user_message: str, preload_skill_names: List[str]) -> List[Dict]:
+    def _build_conversation_messages(
+        self,
+        normalized_user_message: str,
+        preload_skill_names: List[str],
+    ) -> List[Dict]:
         """Build the message list for the next LLM call."""
-        messages: List[Dict[str, Any]] = [self._get_system_message()]
+        messages: List[Dict[str, Any]] = [self._build_system_message()]
 
         summary_message = self.context.get_summary_message()
         if summary_message is not None:
@@ -317,7 +410,7 @@ Be concise and helpful."""
         messages.append({"role": ROLE_USER, "content": normalized_user_message})
         return messages
 
-    def _maybe_auto_compact(
+    def _run_auto_compaction_if_needed(
         self,
         turn_id: int,
         on_event: Optional[TurnActivityCallback],
@@ -386,7 +479,7 @@ Be concise and helpful."""
             after_tokens=result.after_tokens,
         )
 
-    def _assistant_message_from_response(self, response: Dict) -> Dict:
+    def _build_assistant_history_message(self, response: Dict) -> Dict:
         """Convert an assistant response into a replayable conversation message."""
         message = {
             "role": response["role"],
@@ -409,7 +502,7 @@ Be concise and helpful."""
 
         return message
 
-    def _tool_result_message(self, tool_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_tool_result_message(self, tool_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
         """Build the replayable tool result message appended to the conversation."""
         return {
             "role": ROLE_TOOL,
@@ -417,7 +510,20 @@ Be concise and helpful."""
             "content": json.dumps(result),
         }
 
-    def _execute_tool_call(self, tool_call: Dict, parsed_args: Dict) -> Tuple[Dict, Dict]:
+    def _parse_tool_arguments_for_logging(self, raw_arguments: str) -> Dict[str, Any]:
+        """Parse tool arguments for logging and UI callbacks without aborting the turn."""
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            return {
+                "raw_arguments": raw_arguments,
+                "parse_error": str(exc),
+            }
+        if isinstance(arguments, dict):
+            return arguments
+        return {"value": arguments}
+
+    def _execute_standard_tool_call(self, tool_call: Dict, parsed_args: Dict) -> Tuple[Dict, Dict]:
         """Execute a single tool call.
 
         Args:
@@ -447,7 +553,7 @@ Be concise and helpful."""
         except Exception as e:
             result = {"error": f"Error executing tool: {e}"}
 
-        return self._tool_result_message(tool_id, result), result
+        return self._build_tool_result_message(tool_id, result), result
 
     def _process_subagent_tool_batch(
         self,
@@ -460,73 +566,105 @@ Be concise and helpful."""
         tools_used: Optional[List[str]],
     ) -> int:
         """Process one consecutive run_subagent batch with bounded parallel fan-out."""
-        if self.subagent_manager is None:
-            for tool_call in tool_calls:
-                parsed_args = json.loads(tool_call["arguments"])
-                result_content = {"error": "Subagent runtime is not available"}
-                messages.append(self._tool_result_message(tool_call["id"], result_content))
-                self.logger.log_tool_result(
-                    turn_id=turn_id,
-                    iteration=iteration,
-                    tool_name="run_subagent",
-                    result=result_content,
-                    tool_call_id=tool_call["id"],
-                )
-            return len(tool_calls)
-
-        pending_results: List[Tuple[Dict[str, Any], Dict[str, Any] | None, Any | None]] = []
-        valid_tool_calls: List[Dict[str, Any]] = []
-        requests = []
+        resolved_tool_calls: List[_SubagentToolCallResolution] = []
 
         for tool_call in tool_calls:
-            parsed_args = json.loads(tool_call["arguments"])
+            logging_arguments = self._parse_tool_arguments_for_logging(tool_call["arguments"])
             tool_call_id = tool_call["id"]
             if on_tool_call is not None:
-                on_tool_call("run_subagent", parsed_args)
+                on_tool_call("run_subagent", logging_arguments)
 
             self.logger.log_tool_call(
                 turn_id=turn_id,
                 iteration=iteration,
                 tool_name="run_subagent",
-                arguments=parsed_args,
+                arguments=logging_arguments,
                 tool_call_id=tool_call_id,
             )
 
             if tools_used is not None and "run_subagent" not in tools_used:
                 tools_used.append("run_subagent")
 
-            try:
-                request = self.subagent_manager.build_request(parsed_args)
-            except ValueError as exc:
-                pending_results.append((tool_call, parsed_args, {"error": str(exc)}))
+            if self.subagent_manager is None:
+                resolved_tool_calls.append(
+                    _SubagentToolCallResolution(
+                        tool_call_id=tool_call_id,
+                        error_payload={"error": "Subagent runtime is not available"},
+                    )
+                )
                 continue
 
-            pending_results.append((tool_call, parsed_args, None))
-            valid_tool_calls.append(tool_call)
-            requests.append(request)
+            try:
+                arguments = json.loads(tool_call["arguments"])
+            except json.JSONDecodeError as exc:
+                resolved_tool_calls.append(
+                    _SubagentToolCallResolution(
+                        tool_call_id=tool_call_id,
+                        error_payload={"error": f"Invalid JSON in tool arguments: {exc}"},
+                    )
+                )
+                continue
 
-        subagent_results = self.subagent_manager.run_batch(
-            self,
-            requests,
-            parent_turn_id=turn_id,
-            iteration=iteration,
-            on_event=on_event,
-        ) if requests else []
-        result_iter = iter(subagent_results)
+            if not isinstance(arguments, dict):
+                resolved_tool_calls.append(
+                    _SubagentToolCallResolution(
+                        tool_call_id=tool_call_id,
+                        error_payload={"error": "Tool arguments must decode to a JSON object"},
+                    )
+                )
+                continue
 
-        for tool_call, _parsed_args, immediate_error in pending_results:
-            if immediate_error is not None:
-                result_content = immediate_error
-            else:
-                result_content = self.subagent_manager.result_to_payload(next(result_iter))
+            try:
+                request = self.subagent_manager.build_subagent_request(arguments)
+            except ValueError as exc:
+                resolved_tool_calls.append(
+                    _SubagentToolCallResolution(
+                        tool_call_id=tool_call_id,
+                        error_payload={"error": str(exc)},
+                    )
+                )
+                continue
 
-            messages.append(self._tool_result_message(tool_call["id"], result_content))
+            resolved_tool_calls.append(
+                _SubagentToolCallResolution(
+                    tool_call_id=tool_call_id,
+                    request=request,
+                )
+            )
+
+        valid_requests = [
+            resolved_tool_call.request
+            for resolved_tool_call in resolved_tool_calls
+            if resolved_tool_call.request is not None
+        ]
+        subagent_results: List[Any] = []
+        if self.subagent_manager is not None and valid_requests:
+            subagent_results = self.subagent_manager.run_subagents(
+                self,
+                valid_requests,
+                parent_turn_id=turn_id,
+                on_event=on_event,
+            )
+        subagent_results_iter = iter(subagent_results)
+
+        for resolved_tool_call in resolved_tool_calls:
+            result_payload = (
+                resolved_tool_call.error_payload
+                if resolved_tool_call.error_payload is not None
+                else next(subagent_results_iter).to_payload()
+            )
+            messages.append(
+                self._build_tool_result_message(
+                    resolved_tool_call.tool_call_id,
+                    result_payload,
+                )
+            )
             self.logger.log_tool_result(
                 turn_id=turn_id,
                 iteration=iteration,
                 tool_name="run_subagent",
-                result=result_content,
-                tool_call_id=tool_call["id"],
+                result=result_payload,
+                tool_call_id=resolved_tool_call.tool_call_id,
             )
 
         return len(tool_calls)
@@ -552,18 +690,18 @@ Be concise and helpful."""
         processed_count = 0
         index = 0
         while index < len(tool_calls):
-            tool_call = tool_calls[index]
-            parsed_args = json.loads(tool_call["arguments"])
-            tool_name = tool_call["name"]
-            tool_call_id = tool_call["id"]
+            current_tool_call = tool_calls[index]
+            parsed_args = json.loads(current_tool_call["arguments"])
+            tool_name = current_tool_call["name"]
+            tool_call_id = current_tool_call["id"]
 
             if tool_name == "run_subagent":
-                batch_calls: List[Dict[str, Any]] = []
+                subagent_batch: List[Dict[str, Any]] = []
                 while index < len(tool_calls) and tool_calls[index]["name"] == "run_subagent":
-                    batch_calls.append(tool_calls[index])
+                    subagent_batch.append(tool_calls[index])
                     index += 1
                 processed_count += self._process_subagent_tool_batch(
-                    batch_calls,
+                    subagent_batch,
                     messages,
                     turn_id,
                     iteration,
@@ -612,7 +750,7 @@ Be concise and helpful."""
                 tool_call_id=tool_call_id,
             )
 
-            tool_result_message, result_content = self._execute_tool_call(tool_call, parsed_args)
+            tool_result_message, result_content = self._execute_standard_tool_call(current_tool_call, parsed_args)
             messages.append(tool_result_message)
             duration_s = perf_counter() - started_at
 
@@ -655,7 +793,7 @@ Be concise and helpful."""
             index += 1
         return processed_count
 
-    def _finalize_response(self, user_message: str, final_response: str) -> None:
+    def _append_completed_turn_to_context(self, user_message: str, final_response: str) -> None:
         """Save and log final agent response.
 
         Args:
@@ -667,7 +805,52 @@ Be concise and helpful."""
         # Note: Response is already logged by llm_client.log_llm_response()
         # No need to log again here
 
-    def _handle_max_iterations(
+    def _emit_turn_completed_event(
+        self,
+        on_event: Optional[TurnActivityCallback],
+        *,
+        status: str,
+        tool_call_count: int,
+        tools_used: List[str],
+        skills_used: List[str],
+    ) -> None:
+        """Emit the shared turn-completed event payload."""
+        self._emit_turn_event(
+            on_event,
+            "turn_completed",
+            status=status,
+            llm_call_count=len(self.request_metrics),
+            tool_call_count=tool_call_count,
+            tools_used=tools_used,
+            skills_used=skills_used,
+        )
+
+    def _finish_successful_turn(
+        self,
+        *,
+        turn_id: int,
+        user_message: str,
+        final_response: str,
+        tool_call_count: int,
+        tools_used: List[str],
+        skills_used: List[str],
+        on_event: Optional[TurnActivityCallback],
+    ) -> str:
+        """Finalize a successful turn and return the response text."""
+        self._append_completed_turn_to_context(user_message, final_response)
+        self.logger.finish_turn(
+            turn_id, final_response, self.request_metrics, status="completed"
+        )
+        self._emit_turn_completed_event(
+            on_event,
+            status="completed",
+            tool_call_count=tool_call_count,
+            tools_used=tools_used,
+            skills_used=skills_used,
+        )
+        return final_response
+
+    def _finish_turn_after_max_iterations(
         self,
         normalized_user_message: str,
         turn_id: int,
@@ -711,18 +894,16 @@ Be concise and helpful."""
             phase="agent.max_iterations",
             message=error_response,
         )
-        self._emit_turn_event(
+        self._emit_turn_completed_event(
             on_event,
-            "turn_completed",
             status="error",
-            llm_call_count=len(self.request_metrics),
             tool_call_count=tool_call_count,
             tools_used=tools_used,
             skills_used=skills_used,
         )
         return error_response
 
-    def _handle_exception(
+    def _finish_turn_after_exception(
         self,
         exc: Exception,
         turn_id: int,
@@ -765,15 +946,217 @@ Be concise and helpful."""
             phase=phase,
             message=str(exc),
         )
-        self._emit_turn_event(
+        self._emit_turn_completed_event(
             on_event,
-            "turn_completed",
             status="error",
-            llm_call_count=len(self.request_metrics),
             tool_call_count=tool_call_count,
             tools_used=tools_used,
             skills_used=skills_used,
         )
+
+    def _run_non_stream_model_iteration(
+        self,
+        *,
+        turn_id: int,
+        iteration: int,
+        conversation_messages: List[Dict[str, Any]],
+        on_event: Optional[TurnActivityCallback],
+    ) -> _ModelIterationResult:
+        """Run one non-streaming LLM iteration and return its outcome."""
+        self._emit_llm_call_started(
+            on_event,
+            iteration=iteration,
+            stream=False,
+            messages=conversation_messages,
+        )
+        response, metrics = self.llm.chat(
+            conversation_messages,
+            tools=self._cached_tool_schemas,
+            log_context=self._build_llm_log_context(turn_id, iteration, stream=False),
+        )
+        metrics.iteration = iteration
+        self.request_metrics.append(metrics)
+        self._store_recent_prompt_metrics(metrics)
+        conversation_messages.append(self._build_assistant_history_message(response))
+
+        tool_calls = response.get("tool_calls", [])
+        self._emit_llm_call_finished(
+            on_event,
+            iteration=iteration,
+            stream=False,
+            metrics=metrics,
+            tool_calls=tool_calls,
+        )
+        if not tool_calls:
+            return _ModelIterationResult(
+                outcome="final_answer",
+                assistant_text=response.get("content", ""),
+                requested_tool_calls=[],
+            )
+        return _ModelIterationResult(
+            outcome="tool_calls",
+            assistant_text="",
+            requested_tool_calls=tool_calls,
+        )
+
+    def _run_stream_model_iteration(
+        self,
+        *,
+        turn_id: int,
+        iteration: int,
+        conversation_messages: List[Dict[str, Any]],
+        on_event: Optional[TurnActivityCallback],
+    ):
+        """Run one streaming LLM iteration and yield response chunks as they arrive."""
+        self._emit_llm_call_started(
+            on_event,
+            iteration=iteration,
+            stream=True,
+            messages=conversation_messages,
+        )
+        streamed_text_chunks: List[str] = []
+        assistant_role = "assistant"
+
+        for chunk in self.llm.chat_stream(
+            conversation_messages,
+            tools=self._cached_tool_schemas,
+            log_context=self._build_llm_log_context(turn_id, iteration, stream=True),
+        ):
+            if "role" in chunk:
+                assistant_role = chunk["role"]
+            if "delta" in chunk:
+                streamed_text_chunks.append(chunk["delta"])
+                yield chunk["delta"]
+
+        stream_metrics = self.llm.get_stream_metrics()
+        if stream_metrics:
+            stream_metrics.iteration = iteration
+            self.request_metrics.append(stream_metrics)
+            self._store_recent_prompt_metrics(stream_metrics)
+
+        tool_calls = self.llm.get_stream_tool_calls()
+        metrics_for_event = stream_metrics or LLMMetrics()
+        self._emit_llm_call_finished(
+            on_event,
+            iteration=iteration,
+            stream=True,
+            metrics=metrics_for_event,
+            tool_calls=tool_calls,
+        )
+
+        if not tool_calls:
+            return _ModelIterationResult(
+                outcome="final_answer",
+                assistant_text="".join(streamed_text_chunks),
+                requested_tool_calls=[],
+            )
+
+        conversation_messages.append(
+            self._build_assistant_history_message({
+                "role": assistant_role,
+                "content": "".join(streamed_text_chunks),
+                "tool_calls": tool_calls,
+            })
+        )
+        return _ModelIterationResult(
+            outcome="tool_calls",
+            assistant_text="",
+            requested_tool_calls=tool_calls,
+        )
+
+    def _run_agent_turn(
+        self,
+        user_message: str,
+        *,
+        stream: bool,
+        on_tool_call: Optional[Callable],
+        on_event: Optional[TurnActivityCallback],
+    ):
+        """Run the shared agent turn loop, yielding chunks only in streaming mode."""
+        self.request_metrics.clear()
+        turn_state = self._create_turn_state(user_message, on_event)
+
+        try:
+            for iteration in range(self.max_iterations):
+                if stream:
+                    model_iteration = yield from self._run_stream_model_iteration(
+                        turn_id=turn_state.turn_id,
+                        iteration=iteration,
+                        conversation_messages=turn_state.conversation_messages,
+                        on_event=on_event,
+                    )
+                else:
+                    model_iteration = self._run_non_stream_model_iteration(
+                        turn_id=turn_state.turn_id,
+                        iteration=iteration,
+                        conversation_messages=turn_state.conversation_messages,
+                        on_event=on_event,
+                    )
+
+                if model_iteration.outcome == "final_answer":
+                    final_response = self._finish_successful_turn(
+                        turn_id=turn_state.turn_id,
+                        user_message=turn_state.normalized_user_message,
+                        final_response=model_iteration.assistant_text,
+                        tool_call_count=turn_state.tool_call_count,
+                        tools_used=turn_state.tools_used,
+                        skills_used=turn_state.skills_used,
+                        on_event=on_event,
+                    )
+                    turn_state.is_finished = True
+                    return final_response
+
+                turn_state.tool_call_count += self._process_tool_calls(
+                    model_iteration.requested_tool_calls,
+                    turn_state.conversation_messages,
+                    turn_state.turn_id,
+                    iteration,
+                    on_tool_call,
+                    on_event,
+                    turn_state.tools_used,
+                    turn_state.skills_used,
+                )
+
+            if stream:
+                error_response = "I reached the maximum number of iterations. Please try a simpler request."
+                for char in error_response:
+                    yield char
+                return self._finish_turn_after_max_iterations(
+                    turn_state.normalized_user_message,
+                    turn_state.turn_id,
+                    turn_state.tool_call_count,
+                    turn_state.tools_used,
+                    turn_state.skills_used,
+                    on_event,
+                )
+            return self._finish_turn_after_max_iterations(
+                turn_state.normalized_user_message,
+                turn_state.turn_id,
+                turn_state.tool_call_count,
+                turn_state.tools_used,
+                turn_state.skills_used,
+                on_event,
+            )
+        except Exception as exc:
+            self._finish_turn_after_exception(
+                exc,
+                turn_state.turn_id,
+                turn_state.tool_call_count,
+                turn_state.tools_used,
+                turn_state.skills_used,
+                turn_state.is_finished,
+                on_event,
+                "agent.run_stream" if stream else "agent.run",
+            )
+            raise
+
+    def _drain_turn_runner(self, turn_runner) -> str:
+        """Exhaust a shared turn runner and return its final response string."""
+        while True:
+            try:
+                next(turn_runner)
+            except StopIteration as stop:
+                return stop.value
 
     def run(
         self,
@@ -791,92 +1174,14 @@ Be concise and helpful."""
         Returns:
             The agent's final response as a string
         """
-        self.request_metrics.clear()
-        turn_id, tools_used, skills_used, messages, normalized_user_message = self._initialize_turn(
-            user_message, on_event
+        return self._drain_turn_runner(
+            self._run_agent_turn(
+                user_message,
+                stream=False,
+                on_tool_call=on_tool_call,
+                on_event=on_event,
+            )
         )
-        tool_call_count = 0
-        turn_finished = False
-
-        try:
-            for iteration in range(self.max_iterations):
-                self._emit_turn_event(
-                    on_event,
-                    "llm_call_started",
-                    iteration=iteration,
-                    stream=False,
-                    message_count=len(messages),
-                    tool_schema_count=len(self._cached_tool_schemas),
-                )
-                response, metrics = self.llm.chat(
-                    messages,
-                    tools=self._cached_tool_schemas,
-                    log_context={
-                        "turn_id": turn_id,
-                        "iteration": iteration,
-                        "stream": False,
-                        "request_kind": self.request_kind,
-                    },
-                )
-                metrics.iteration = iteration
-                self.request_metrics.append(metrics)
-                self._record_prompt_metrics(metrics)
-                messages.append(self._assistant_message_from_response(response))
-
-                tool_calls = response.get("tool_calls", [])
-                self._emit_turn_event(
-                    on_event,
-                    "llm_call_finished",
-                    iteration=iteration,
-                    stream=False,
-                    **self._metrics_event_details(metrics),
-                    has_tool_calls=bool(tool_calls),
-                    tool_call_count=len(tool_calls),
-                    result_kind="tool_calls" if tool_calls else "final_answer",
-                )
-
-                if not tool_calls:
-                    final_response = response.get("content", "")
-                    self._finalize_response(normalized_user_message, final_response)
-                    self.logger.finish_turn(
-                        turn_id, final_response, self.request_metrics, status="completed"
-                    )
-                    self._emit_turn_event(
-                        on_event,
-                        "turn_completed",
-                        status="completed",
-                        llm_call_count=len(self.request_metrics),
-                        tool_call_count=tool_call_count,
-                        tools_used=tools_used,
-                        skills_used=skills_used,
-                    )
-                    turn_finished = True
-                    return final_response
-
-                tool_call_count += self._process_tool_calls(
-                    tool_calls,
-                    messages,
-                    turn_id,
-                    iteration,
-                    on_tool_call,
-                    on_event,
-                    tools_used,
-                    skills_used,
-                )
-
-            return self._handle_max_iterations(
-                normalized_user_message,
-                turn_id,
-                tool_call_count,
-                tools_used,
-                skills_used,
-                on_event,
-            )
-        except Exception as exc:
-            self._handle_exception(
-                exc, turn_id, tool_call_count, tools_used, skills_used, turn_finished, on_event, "agent.run"
-            )
-            raise
 
     def run_stream(
         self,
@@ -894,111 +1199,9 @@ Be concise and helpful."""
         Yields:
             Tokens/chunks of the response as they arrive
         """
-        self.request_metrics.clear()
-        turn_id, tools_used, skills_used, messages, normalized_user_message = self._initialize_turn(
-            user_message, on_event
+        yield from self._run_agent_turn(
+            user_message,
+            stream=True,
+            on_tool_call=on_tool_call,
+            on_event=on_event,
         )
-        tool_call_count = 0
-        turn_finished = False
-
-        try:
-            for iteration in range(self.max_iterations):
-                self._emit_turn_event(
-                    on_event,
-                    "llm_call_started",
-                    iteration=iteration,
-                    stream=True,
-                    message_count=len(messages),
-                    tool_schema_count=len(self._cached_tool_schemas),
-                )
-                buffer = []
-                current_role = "assistant"
-
-                for chunk in self.llm.chat_stream(
-                    messages,
-                    tools=self._cached_tool_schemas,
-                    log_context={
-                        "turn_id": turn_id,
-                        "iteration": iteration,
-                        "stream": True,
-                        "request_kind": self.request_kind,
-                    },
-                ):
-                    if "role" in chunk:
-                        current_role = chunk["role"]
-                    if "delta" in chunk:
-                        buffer.append(chunk["delta"])
-                        yield chunk["delta"]
-
-                stream_metrics = self.llm.get_stream_metrics()
-                if stream_metrics:
-                    stream_metrics.iteration = iteration
-                    self.request_metrics.append(stream_metrics)
-                    self._record_prompt_metrics(stream_metrics)
-
-                tool_calls = self.llm.get_stream_tool_calls()
-                metrics_for_event = stream_metrics or LLMMetrics()
-                self._emit_turn_event(
-                    on_event,
-                    "llm_call_finished",
-                    iteration=iteration,
-                    stream=True,
-                    **self._metrics_event_details(metrics_for_event),
-                    has_tool_calls=bool(tool_calls),
-                    tool_call_count=len(tool_calls),
-                    result_kind="tool_calls" if tool_calls else "final_answer",
-                )
-
-                if not tool_calls:
-                    final_response = "".join(buffer) if buffer else ""
-                    self._finalize_response(normalized_user_message, final_response)
-                    self.logger.finish_turn(
-                        turn_id, final_response, self.request_metrics, status="completed"
-                    )
-                    self._emit_turn_event(
-                        on_event,
-                        "turn_completed",
-                        status="completed",
-                        llm_call_count=len(self.request_metrics),
-                        tool_call_count=tool_call_count,
-                        tools_used=tools_used,
-                        skills_used=skills_used,
-                    )
-                    turn_finished = True
-                    return
-
-                messages.append(
-                    self._assistant_message_from_response({
-                        "role": current_role,
-                        "content": "".join(buffer),
-                        "tool_calls": tool_calls,
-                    })
-                )
-
-                tool_call_count += self._process_tool_calls(
-                    tool_calls,
-                    messages,
-                    turn_id,
-                    iteration,
-                    on_tool_call,
-                    on_event,
-                    tools_used,
-                    skills_used,
-                )
-
-            error_response = "I reached the maximum number of iterations. Please try a simpler request."
-            for char in error_response:
-                yield char
-            return self._handle_max_iterations(
-                normalized_user_message,
-                turn_id,
-                tool_call_count,
-                tools_used,
-                skills_used,
-                on_event,
-            )
-        except Exception as exc:
-            self._handle_exception(
-                exc, turn_id, tool_call_count, tools_used, skills_used, turn_finished, on_event, "agent.run_stream"
-            )
-            raise

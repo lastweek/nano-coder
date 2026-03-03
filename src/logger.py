@@ -43,6 +43,18 @@ class _TurnState:
     status: str = "open"
 
 
+@dataclass(frozen=True)
+class SessionLogSnapshot:
+    """In-memory aggregate view of one logger session."""
+
+    session_dir: str
+    llm_log: str
+    events_log: str
+    llm_call_count: int
+    tool_call_count: int
+    tools_used: List[str]
+
+
 class SessionLogger:
     """Write per-session logs to a session directory."""
 
@@ -120,6 +132,7 @@ class SessionLogger:
         self._timeline_seq = 0
         self._llm_call_count = 0
         self._tool_call_count = 0
+        self._session_tools_used: List[str] = []
         self._skill_event_count = 0
         self._error_count = 0
         self._turns: Dict[int, _TurnState] = {}
@@ -300,6 +313,8 @@ class SessionLogger:
             turn_state.tool_call_count += 1
             if tool_name not in turn_state.tools_used:
                 turn_state.tools_used.append(tool_name)
+        if tool_name not in self._session_tools_used:
+            self._session_tools_used.append(tool_name)
 
         self._submit_write(
             self._record_tool_call,
@@ -473,6 +488,28 @@ class SessionLogger:
         self._ensure_initialized()
         assert self._events_path is not None
         return self._events_path
+
+    def get_session_snapshot(self) -> SessionLogSnapshot:
+        """Return the current in-memory aggregate session state."""
+        if not self.enabled:
+            return SessionLogSnapshot(
+                session_dir="",
+                llm_log="",
+                events_log="",
+                llm_call_count=self._llm_call_count,
+                tool_call_count=self._tool_call_count,
+                tools_used=list(self._session_tools_used),
+            )
+
+        session_dir = self.ensure_session_dir()
+        return SessionLogSnapshot(
+            session_dir=str(session_dir),
+            llm_log=str(self.get_llm_log_path()),
+            events_log=str(self.get_events_path()),
+            llm_call_count=self._llm_call_count,
+            tool_call_count=self._tool_call_count,
+            tools_used=list(self._session_tools_used),
+        )
 
     def _update_symlink(self, link_path: Path, target: Path) -> None:
         """Create or refresh a symlink when supported."""

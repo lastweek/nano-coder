@@ -19,8 +19,9 @@ from rich.live import Live
 
 from src.context import Context
 from src.llm import LLMClient
+from src.metrics import LLMMetrics
+from src.tools import build_tool_registry
 from src.agent import Agent
-from src.metrics_display import display_metrics
 from src.config import config
 from src.mcp import MCPManager
 from src.skills import SkillManager
@@ -28,7 +29,6 @@ from src.commands import CommandRegistry
 from src.commands import builtin
 from src.turn_display import TurnProgressDisplay
 from src.subagents import SubagentManager
-from src.tool_builder import build_tool_registry
 
 REQUEST_TYPE_STREAMING = "streaming"
 REQUEST_TYPE_NON_STREAMING = "non-streaming"
@@ -74,6 +74,39 @@ def _final_response_from_context(agent, fallback: str) -> str:
     if messages and messages[-1]["role"] == "assistant":
         return messages[-1]["content"]
     return fallback
+
+
+def display_metrics(console: Console, metrics_list: list[LLMMetrics], request_type: str) -> None:
+    """Display aggregate request metrics after the final answer."""
+    if not metrics_list:
+        return
+
+    total_prompt_tokens = sum(metric.prompt_tokens for metric in metrics_list)
+    total_completion_tokens = sum(metric.completion_tokens for metric in metrics_list)
+    total_duration = sum(metric.duration for metric in metrics_list)
+    provider = metrics_list[0].provider if metrics_list else ""
+    model = metrics_list[0].model if metrics_list else ""
+
+    parts = [
+        f"{total_prompt_tokens} prompt tokens",
+        f"{total_completion_tokens} completion tokens",
+        f"{total_duration:.2f}s",
+    ]
+
+    if request_type == REQUEST_TYPE_STREAMING:
+        first_stream = next(
+            (metric for metric in metrics_list if metric.request_type == REQUEST_TYPE_STREAMING),
+            None,
+        )
+        if first_stream and first_stream.ttft > 0:
+            parts.append(f"TTFT {first_stream.ttft:.2f}s")
+        if first_stream and first_stream.tpot > 0:
+            parts.append(f"TPOT {first_stream.tpot:.2f}s")
+
+    if model and provider:
+        parts.append(f"{model} ({provider})")
+
+    console.print(Text(" • ".join(parts), style="dim"))
 
 
 def run_agent_turn(

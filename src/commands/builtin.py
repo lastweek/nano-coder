@@ -6,8 +6,12 @@ from rich.panel import Panel
 from rich.text import Text
 from typing import Any, Optional
 
-from src.commands.help import render_command_help, render_unknown_subcommand
-from src.commands.registry import CommandHelpSpec, CommandSubcommandHelp
+from src.commands.registry import (
+    CommandHelpSpec,
+    CommandSubcommandHelp,
+    render_command_help,
+    render_unknown_subcommand,
+)
 from src.context_usage import build_context_usage_snapshot, format_token_count
 
 
@@ -440,13 +444,12 @@ def register_all(registry):
                     render_command_help(console, command, "run")
                 return
 
-            request = subagent_manager.build_request({"task": remainder})
-            result = subagent_manager.run_one(
+            request = subagent_manager.build_subagent_request({"task": remainder})
+            result = subagent_manager.run_subagents(
                 agent,
-                request,
+                [request],
                 parent_turn_id=None,
-                iteration=0,
-            )
+            )[0]
             metadata = "\n".join([
                 f"[bold]ID:[/bold] {result.subagent_id}",
                 f"[bold]Label:[/bold] {result.label}",

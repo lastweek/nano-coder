@@ -1,5 +1,7 @@
 """Tool system and built-in tool package for Nano-Coder."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -86,7 +88,49 @@ class ToolRegistry:
         return list(self._tools.keys())
 
 
+def build_tool_registry(
+    *,
+    skill_manager,
+    mcp_manager=None,
+    subagent_manager=None,
+    include_subagent_tool: bool = True,
+) -> ToolRegistry:
+    """Build the standard tool registry for a parent or child agent."""
+    from src.config import config
+    from src.tools.bash import BashTool
+    from src.tools.read import ReadTool
+    from src.tools.skill import LoadSkillTool
+    from src.tools.subagent import RunSubagentTool
+    from src.tools.write import WriteTool
+
+    registry = ToolRegistry()
+    registry.register(ReadTool())
+    registry.register(WriteTool())
+    registry.register(BashTool())
+    registry.register(LoadSkillTool(skill_manager))
+
+    if mcp_manager is not None:
+        mcp_manager.register_tools(registry)
+
+    if include_subagent_tool and subagent_manager is not None and config.subagents.enabled:
+        registry.register(RunSubagentTool(subagent_manager))
+
+    return registry
+
+
+def clone_tool_registry(source: ToolRegistry, *, include_subagent_tool: bool = True) -> ToolRegistry:
+    """Clone a registry by reusing tool instances from an existing registry."""
+    registry = ToolRegistry()
+    for tool in source._tools.values():
+        if not include_subagent_tool and tool.name == "run_subagent":
+            continue
+        registry.register(tool)
+    return registry
+
+
 __all__ = [
+    "build_tool_registry",
+    "clone_tool_registry",
     "REQUEST_KIND_AGENT_TURN",
     "REQUEST_KIND_CONTEXT_COMPACTION",
     "REQUEST_KIND_SUBAGENT_TURN",

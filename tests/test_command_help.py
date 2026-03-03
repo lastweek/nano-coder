@@ -4,11 +4,11 @@ import io
 
 from rich.console import Console
 
-from src.commands.help import render_command_help
 from src.commands.registry import (
     Command,
     CommandHelpSpec,
     CommandSubcommandHelp,
+    render_command_help,
 )
 
 

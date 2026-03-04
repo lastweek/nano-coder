@@ -3,11 +3,14 @@
 from dataclasses import dataclass
 import json
 from typing import Callable, Optional, List, Dict, Any, Literal, Tuple
+from src.agent_compaction import run_auto_compaction_if_needed
+from src.agent_turn_prep import PendingSkillEvent, build_conversation_messages, prepare_turn_input
 from src.activity_preview import (
     build_assistant_preview,
     build_tool_signature,
 )
 from src.plan_mode import build_build_execution_contract, build_plan_prompt
+from src.message_types import ChatMessage, ToolCallPayload, ToolResultPayload
 from src.tools import (
     ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL,
     REQUEST_KIND_AGENT_TURN,
@@ -27,7 +30,7 @@ class _ModelIterationResult:
 
     outcome: Literal["final_answer", "tool_calls"]
     assistant_text: str
-    requested_tool_calls: List[Dict[str, Any]]
+    requested_tool_calls: List[ToolCallPayload]
 
 
 @dataclass
@@ -36,7 +39,7 @@ class _AgentTurnState:
 
     turn_id: int
     normalized_user_message: str
-    conversation_messages: List[Dict[str, Any]]
+    conversation_messages: List[ChatMessage]
     tools_used: List[str]
     skills_used: List[str]
     tool_call_count: int = 0
@@ -55,6 +58,7 @@ class Agent:
         logger: Optional[SessionLogger] = None,
         request_kind: str = REQUEST_KIND_AGENT_TURN,
         subagent_manager=None,
+        runtime_config: Optional[Config] = None,
     ):
         """Initialize the agent.
 
@@ -70,9 +74,10 @@ class Agent:
         self.skill_manager = skill_manager
         self.request_kind = request_kind
         self.subagent_manager = subagent_manager
-        current_config = Config.load()
+        self.runtime_config = runtime_config or Config.load()
+        current_config = self.runtime_config
         self.max_iterations = current_config.agent.max_iterations
-        self.logger = logger or SessionLogger(context.session_id)
+        self.logger = logger or SessionLogger(context.session_id, runtime_config=current_config)
         self.logger.start_session(
             cwd=self.context.cwd,
             provider=getattr(self.llm, "provider", "unknown"),
@@ -199,12 +204,14 @@ class Agent:
     def _replay_pending_skill_events(
         self,
         turn_id: int,
-        pending_skill_events: List[Tuple[str, Dict[str, Any]]],
+        pending_skill_events: List[PendingSkillEvent],
         on_event: Optional[TurnActivityCallback],
         skills_used: List[str],
     ) -> None:
         """Write deferred skill events after a turn id exists."""
-        for event_name, details in pending_skill_events:
+        for pending_event in pending_skill_events:
+            event_name = pending_event.name
+            details = pending_event.details
             self._emit_skill_event(turn_id, event_name, **details)
 
             if event_name == "preload":
@@ -333,7 +340,7 @@ Be concise and helpful."""
         else:
             self.context.last_prompt_tokens = None
             self.context.last_prompt_cached_tokens = None
-        self.context.last_context_window = Config.load().llm.context_window
+        self.context.last_context_window = self.runtime_config.llm.context_window
 
     def _create_turn_state(
         self,
@@ -349,28 +356,42 @@ Be concise and helpful."""
         Returns:
             Mutable turn state shared by the main agent loop.
         """
-        normalized_user_message, preload_skill_names, pending_skill_events = self._prepare_user_message_for_turn(user_message)
+        prepared_turn_input = prepare_turn_input(
+            user_message,
+            context=self.context,
+            skill_manager=self.skill_manager,
+        )
         turn_id = self.logger.start_turn(
             raw_user_input=user_message,
-            normalized_user_input=normalized_user_message,
+            normalized_user_input=prepared_turn_input.normalized_user_message,
         )
         tools_used: List[str] = []
         skills_used: List[str] = []
-        self._replay_pending_skill_events(turn_id, pending_skill_events, on_event, skills_used)
+        self._replay_pending_skill_events(
+            turn_id,
+            prepared_turn_input.pending_skill_events,
+            on_event,
+            skills_used,
+        )
 
         # Cache tool schemas for hot-path optimization (only once)
         if self._cached_tool_schemas is None:
             self._cached_tool_schemas = self.tools.get_tool_schemas()
 
         self._run_auto_compaction_if_needed(turn_id, on_event)
-        conversation_messages = self._build_conversation_messages(
-            normalized_user_message,
-            preload_skill_names,
+        conversation_messages = build_conversation_messages(
+            system_message=self._build_system_message(),
+            summary_message=self.context.get_summary_message(),
+            history_messages=self.context.get_messages(),
+            skill_manager=self.skill_manager,
+            preload_skill_names=prepared_turn_input.preload_skill_names,
+            normalized_user_message=prepared_turn_input.normalized_user_message,
+            role_user=ROLE_USER,
         )
 
         return _AgentTurnState(
             turn_id=turn_id,
-            normalized_user_message=normalized_user_message,
+            normalized_user_message=prepared_turn_input.normalized_user_message,
             conversation_messages=conversation_messages,
             tools_used=tools_used,
             skills_used=skills_used,
@@ -381,67 +402,19 @@ Be concise and helpful."""
         user_message: str,
     ) -> Tuple[str, List[str], List[Tuple[str, Dict[str, Any]]]]:
         """Normalize the turn input and gather skill preloads without building messages."""
-        pending_skill_events: List[Tuple[str, Dict[str, Any]]] = []
-        normalized_user_message = user_message
-        preload_skill_names: List[str] = []
-
-        if self.skill_manager:
-            pinned_skill_names = [
-                skill_name
-                for skill_name in self.context.get_active_skills()
-                if self.skill_manager.get_skill(skill_name) is not None
-            ]
-            preload_skill_names.extend(pinned_skill_names)
-            for skill_name in pinned_skill_names:
-                skill = self.skill_manager.get_skill(skill_name)
-                if skill is None:
-                    continue
-                pending_skill_events.append((
-                    "preload",
-                    {
-                        "skill_name": skill.name,
-                        "reason": "pinned",
-                        "source": skill.source,
-                        "catalog_visible": skill.catalog_visible,
-                        "skill_file": str(skill.skill_file),
-                    },
-                ))
-
-            mention_result = self.skill_manager.extract_skill_mentions(user_message)
-            explicit_skill_names = [
-                skill_name
-                for skill_name in mention_result.skill_names
-                if skill_name not in preload_skill_names
-            ]
-            preload_skill_names.extend(explicit_skill_names)
-            for skill_name in explicit_skill_names:
-                skill = self.skill_manager.get_skill(skill_name)
-                if skill is None:
-                    continue
-                pending_skill_events.append((
-                    "preload",
-                    {
-                        "skill_name": skill.name,
-                        "reason": "explicit",
-                        "source": skill.source,
-                        "catalog_visible": skill.catalog_visible,
-                        "skill_file": str(skill.skill_file),
-                    },
-                ))
-
-            if mention_result.cleaned_text:
-                normalized_user_message = mention_result.cleaned_text
-            elif mention_result.skill_names:
-                normalized_user_message = "Use the preloaded skill context for this request."
-                pending_skill_events.append((
-                    "normalized_user_message",
-                    {
-                        "reason": "explicit_skill_only",
-                        "content": normalized_user_message,
-                    },
-                ))
-
-        return normalized_user_message, preload_skill_names, pending_skill_events
+        prepared_turn_input = prepare_turn_input(
+            user_message,
+            context=self.context,
+            skill_manager=self.skill_manager,
+        )
+        return (
+            prepared_turn_input.normalized_user_message,
+            prepared_turn_input.preload_skill_names,
+            [
+                (pending_event.name, pending_event.details)
+                for pending_event in prepared_turn_input.pending_skill_events
+            ],
+        )
 
     def _build_conversation_messages(
         self,
@@ -449,19 +422,15 @@ Be concise and helpful."""
         preload_skill_names: List[str],
     ) -> List[Dict]:
         """Build the message list for the next LLM call."""
-        messages: List[Dict[str, Any]] = [self._build_system_message()]
-
-        summary_message = self.context.get_summary_message()
-        if summary_message is not None:
-            messages.append(summary_message)
-
-        messages.extend(self.context.get_messages())
-
-        if self.skill_manager and preload_skill_names:
-            messages.extend(self.skill_manager.build_preload_messages(preload_skill_names))
-
-        messages.append({"role": ROLE_USER, "content": normalized_user_message})
-        return messages
+        return build_conversation_messages(
+            system_message=self._build_system_message(),
+            summary_message=self.context.get_summary_message(),
+            history_messages=self.context.get_messages(),
+            skill_manager=self.skill_manager,
+            preload_skill_names=preload_skill_names,
+            normalized_user_message=normalized_user_message,
+            role_user=ROLE_USER,
+        )
 
     def _run_auto_compaction_if_needed(
         self,
@@ -469,70 +438,9 @@ Be concise and helpful."""
         on_event: Optional[TurnActivityCallback],
     ) -> None:
         """Compact older turns before the first model call when policy requires it."""
-        decision = self.context_compaction.build_decision(self)
-        if not decision.should_compact:
-            return
+        run_auto_compaction_if_needed(self, turn_id, on_event)
 
-        plan = self.context_compaction._build_plan(self, force=False)
-        if not plan.turns_to_compact:
-            return
-
-        self.logger.log_context_compaction_event(
-            turn_id=turn_id,
-            stage="started",
-            reason=decision.reason,
-            covered_turn_count=len(plan.turns_to_compact),
-            retained_turn_count=len(plan.retained_turns),
-        )
-        self._emit_turn_event(
-            on_event,
-            "context_compaction_started",
-            reason=decision.reason,
-            covered_turn_count=len(plan.turns_to_compact),
-            retained_turn_count=len(plan.retained_turns),
-        )
-
-        result = self.context_compaction.compact_now(
-            self,
-            decision.reason,
-            turn_id=turn_id,
-            force=False,
-        )
-        if result.error:
-            self.logger.log_context_compaction_event(
-                turn_id=turn_id,
-                stage="failed",
-                reason=decision.reason,
-                error=result.error,
-            )
-            self._emit_turn_event(
-                on_event,
-                "context_compaction_failed",
-                reason=decision.reason,
-                error=result.error,
-            )
-            return
-
-        self.logger.log_context_compaction_event(
-            turn_id=turn_id,
-            stage="completed",
-            reason=decision.reason,
-            covered_turn_count=result.covered_turn_count,
-            retained_turn_count=result.retained_turn_count,
-            before_tokens=result.before_tokens,
-            after_tokens=result.after_tokens,
-        )
-        self._emit_turn_event(
-            on_event,
-            "context_compaction_completed",
-            reason=decision.reason,
-            covered_turn_count=result.covered_turn_count,
-            retained_turn_count=result.retained_turn_count,
-            before_tokens=result.before_tokens,
-            after_tokens=result.after_tokens,
-        )
-
-    def _build_assistant_history_message(self, response: Dict) -> Dict:
+    def _build_assistant_history_message(self, response: Dict[str, Any]) -> ChatMessage:
         """Convert an assistant response into a replayable conversation message."""
         message = {
             "role": response["role"],
@@ -555,7 +463,7 @@ Be concise and helpful."""
 
         return message
 
-    def _build_tool_result_message(self, tool_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_tool_result_message(self, tool_id: str, result: ToolResultPayload | Dict[str, Any]) -> ChatMessage:
         """Build the replayable tool result message appended to the conversation."""
         return {
             "role": ROLE_TOOL,

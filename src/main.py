@@ -1,5 +1,6 @@
 """Main CLI entry point for Nano-Coder."""
 
+from dataclasses import dataclass
 import os
 import random
 import sys
@@ -25,7 +26,7 @@ from src.metrics import LLMMetrics
 from src.session_runtime import SessionRuntimeController
 from src.tools import ToolProfile, build_tool_registry
 from src.agent import Agent
-from src.config import config
+from src.config import Config, config
 from src.mcp import MCPManager
 from src.skills import SkillManager
 from src.commands import CommandRegistry
@@ -145,21 +146,21 @@ def _animate_banner_fire(console: Console, llm_info_lines: list[Text]) -> None:
             time.sleep(0.08)
 
 
-def print_banner(console: Console) -> None:
+def print_banner(console: Console, runtime_config=None) -> None:
     """Print welcome banner."""
-    from src.config import config
+    runtime_config = runtime_config or config
 
     # Build LLM info lines
     llm_info_lines = []
-    if config.llm.base_url:
-        llm_info_lines.append(Text(f"URL: {config.llm.base_url}", style="dim"))
-    if config.llm.model:
-        model_text = Text(f"Model: {config.llm.model}", style="dim")
-        if config.llm.context_window:
-            model_text.append(Text(f" (context: {config.llm.context_window:,} tokens)", style="dim"))
+    if runtime_config.llm.base_url:
+        llm_info_lines.append(Text(f"URL: {runtime_config.llm.base_url}", style="dim"))
+    if runtime_config.llm.model:
+        model_text = Text(f"Model: {runtime_config.llm.model}", style="dim")
+        if runtime_config.llm.context_window:
+            model_text.append(Text(f" (context: {runtime_config.llm.context_window:,} tokens)", style="dim"))
         llm_info_lines.append(model_text)
-    if config.llm.provider:
-        llm_info_lines.append(Text(f"Provider: {config.llm.provider}", style="dim"))
+    if runtime_config.llm.provider:
+        llm_info_lines.append(Text(f"Provider: {runtime_config.llm.provider}", style="dim"))
 
     if console.is_terminal:
         _animate_banner_fire(console, llm_info_lines)
@@ -240,12 +241,13 @@ def run_agent_turn(
 ) -> str:
     """Run one agent turn with a live chronological activity feed."""
     request_type = REQUEST_TYPE_STREAMING if enable_streaming else REQUEST_TYPE_NON_STREAMING
+    runtime_config = getattr(agent, "runtime_config", None) or config
     display = TurnProgressDisplay(
         session_context=agent.context,
         skill_debug=skill_debug,
         request_type=request_type,
-        live_activity_mode=config.ui.live_activity_mode,
-        live_activity_details=config.ui.live_activity_details,
+        live_activity_mode=runtime_config.ui.live_activity_mode,
+        live_activity_details=runtime_config.ui.live_activity_details,
     )
     live_controls = LiveTurnControls(display)
     response = ""
@@ -314,41 +316,63 @@ def display_streaming_response(console: Console, agent, user_input: str) -> str:
     )
 
 
-def main() -> None:
-    """Main entry point."""
-    # Load environment variables
-    load_dotenv()
+@dataclass
+class AppRuntime:
+    """Assembled runtime dependencies for one CLI session."""
 
-    # Load configuration
-    enable_streaming = config.ui.enable_streaming
-    provider = config.llm.provider
-    skill_debug = env_truthy("SKILL_DEBUG")
+    runtime_config: Config
+    skill_debug: bool
+    enable_streaming: bool
+    context: Context
+    skill_manager: SkillManager
+    mcp_manager: MCPManager | None
+    subagent_manager: SubagentManager
+    tools: object
+    agent: Agent
+    registry: CommandRegistry
+    cmd_context: dict[str, object]
+    input_helper: InputHelper
 
-    # Use stderr for Rich output to avoid conflicts with prompt_toolkit using stdout
-    import sys
-    console = Console(stderr=True)
 
-    if skill_debug:
-        console.print("[dim][SKILL] Debug mode enabled[/dim]")
+def build_console() -> Console:
+    """Create the Rich console used by the CLI."""
+    return Console(stderr=True)
 
-    # Check for API key (from config or environment variable)
-    # Only check if provider requires it (ollama/local don't)
-    if provider not in ("ollama", "local"):
-        # Check if API key is in config or environment
-        api_key_from_config = config.llm.api_key
-        api_key_from_env = os.environ.get(f"{provider.upper()}_API_KEY") or os.environ.get("API_KEY")
 
-        if not api_key_from_config and not api_key_from_env:
-            console.print(f"[red]Error: API key not configured for provider '{provider}'[/red]")
-            console.print(f"\n[dim]Set the API key in config.yaml:[/dim]")
-            console.print(f"[dim]  llm:[/dim]")
-            console.print(f"[dim]    provider: {provider}[/dim]")
-            console.print(f"[dim]    api_key: your-key-here[/dim]\n")
-            sys.exit(1)
+def load_runtime_config(console: Console) -> Config:
+    """Reload config after env bootstrap and print any load diagnostics."""
+    runtime_config = Config.reload()
+    for message in Config.get_load_messages():
+        style = "dim"
+        if message.startswith("Warning:"):
+            style = "yellow"
+        elif message.startswith("No config.yaml"):
+            style = "yellow"
+        console.print(f"[{style}]{message}[/{style}]")
+    return runtime_config
 
-    # Initialize components
-    cwd = Path.cwd()
-    context = Context.create(cwd=str(cwd))
+
+def validate_provider_config(runtime_config: Config) -> str | None:
+    """Return a configuration error for missing provider credentials, if any."""
+    provider = runtime_config.llm.provider
+    if provider in ("ollama", "local"):
+        return None
+
+    api_key_from_config = runtime_config.llm.api_key
+    api_key_from_env = os.environ.get(f"{provider.upper()}_API_KEY") or os.environ.get("API_KEY")
+    if api_key_from_config or api_key_from_env:
+        return None
+
+    return (
+        f"API key not configured for provider '{provider}'.\n\n"
+        "[dim]Set the API key in config.yaml:[/dim]\n"
+        f"[dim]  llm:[/dim]\n[dim]    provider: {provider}[/dim]\n"
+        "[dim]    api_key: your-key-here[/dim]"
+    )
+
+
+def discover_skills(console: Console, cwd: Path, *, skill_debug: bool) -> SkillManager:
+    """Discover local skills and print any warnings."""
     skill_manager = SkillManager(repo_root=cwd)
     skill_warnings = skill_manager.discover()
 
@@ -366,73 +390,95 @@ def main() -> None:
                 "[/dim]"
             )
 
+    return skill_manager
+
+
+def build_mcp_manager(console: Console, runtime_config: Config) -> MCPManager | None:
+    """Create the MCP manager when servers are configured."""
+    if not runtime_config.mcp.servers:
+        return None
+
     try:
-        llm_client = LLMClient()
-    except Exception as e:
-        console.print(f"[red]Error initializing LLM client: {e}[/red]")
-        sys.exit(1)
+        mcp_debug = env_truthy("MCP_DEBUG")
+        if mcp_debug:
+            console.print("[dim][MCP] Debug mode enabled[/dim]")
 
-    # Initialize MCP manager and register MCP tools
-    mcp_manager = None
-    if config.mcp.servers:
-        try:
-            # Enable MCP debug mode via environment variable
-            mcp_debug = env_truthy("MCP_DEBUG")
+        enabled_servers = [server.name for server in runtime_config.mcp.servers if server.enabled]
+        if enabled_servers and mcp_debug:
+            console.print(f"[dim][MCP] Configured servers: {', '.join(enabled_servers)}[/dim]")
 
+        servers_config = [
+            {
+                "name": server.name,
+                "url": server.url,
+                "enabled": server.enabled,
+                "timeout": server.timeout,
+            }
+            for server in runtime_config.mcp.servers
+        ]
+
+        if mcp_debug:
+            console.print("[dim][MCP] Creating MCP manager...[/dim]")
+
+        mcp_manager = MCPManager(servers_config, debug=mcp_debug)
+        if enabled_servers:
             if mcp_debug:
-                console.print("[dim][MCP] Debug mode enabled[/dim]")
+                console.print(
+                    f"[dim][MCP] Successfully loaded {len(enabled_servers)} MCP server(s)[/dim]"
+                )
+            else:
+                console.print(
+                    f"[dim]Loaded {len(enabled_servers)} MCP server(s): {', '.join(enabled_servers)}[/dim]"
+                )
+        return mcp_manager
+    except Exception as exc:
+        console.print(f"[yellow]Warning: Failed to initialize MCP manager: {exc}[/yellow]")
+        return None
 
-            # Show configured servers
-            enabled_servers = [s.name for s in config.mcp.servers if s.enabled]
-            if enabled_servers:
-                if mcp_debug:
-                    console.print(f"[dim][MCP] Configured servers: {', '.join(enabled_servers)}[/dim]")
 
-            # Convert server configs to dicts for MCPManager
-            servers_config = []
-            for server in config.mcp.servers:
-                servers_config.append({
-                    "name": server.name,
-                    "url": server.url,
-                    "enabled": server.enabled,
-                    "timeout": server.timeout
-                })
+def build_agent_runtime(
+    console: Console,
+    runtime_config: Config,
+    cwd: Path,
+    *,
+    skill_debug: bool,
+) -> AppRuntime:
+    """Assemble the runtime dependencies for the interactive CLI."""
+    enable_streaming = runtime_config.ui.enable_streaming
+    context = Context.create(cwd=str(cwd))
+    skill_manager = discover_skills(console, cwd, skill_debug=skill_debug)
 
-            if mcp_debug:
-                console.print("[dim][MCP] Creating MCP manager...[/dim]")
-
-            mcp_manager = MCPManager(servers_config, debug=mcp_debug)
-
-            # Log loaded MCP servers
-            if enabled_servers:
-                if mcp_debug:
-                    console.print(f"[dim][MCP] Successfully loaded {len(enabled_servers)} MCP server(s)[/dim]")
-                else:
-                    console.print(f"[dim]Loaded {len(enabled_servers)} MCP server(s): {', '.join(enabled_servers)}[/dim]")
-        except Exception as e:
-            console.print(f"[yellow]Warning: Failed to initialize MCP manager: {e}[/yellow]")
-
-    subagent_manager = SubagentManager()
+    llm_client = LLMClient(runtime_config=runtime_config)
+    mcp_manager = build_mcp_manager(console, runtime_config)
+    subagent_manager = SubagentManager(runtime_config=runtime_config)
     tools = build_tool_registry(
         skill_manager=skill_manager,
         mcp_manager=mcp_manager,
         subagent_manager=subagent_manager,
-        include_subagent_tool=config.subagents.enabled,
+        include_subagent_tool=runtime_config.subagents.enabled,
         tool_profile=ToolProfile.BUILD,
+        runtime_config=runtime_config,
     )
-
-    # Create agent
     agent = Agent(
         llm_client,
         tools,
         context,
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
+        runtime_config=runtime_config,
     )
 
-    # Create command registry and register built-in commands
     registry = CommandRegistry()
     builtin.register_all(registry)
+
+    cmd_context: dict[str, object] = {
+        "agent": agent,
+        "mcp_manager": mcp_manager,
+        "tools": tools,
+        "skill_manager": skill_manager,
+        "session_context": context,
+        "subagent_manager": subagent_manager,
+    }
 
     def apply_tool_profile(tool_profile: ToolProfile) -> None:
         """Rebuild the parent tool registry for the requested session tool profile."""
@@ -442,19 +488,11 @@ def main() -> None:
             subagent_manager=subagent_manager,
             include_subagent_tool=True,
             tool_profile=tool_profile,
+            runtime_config=runtime_config,
         )
         agent.set_tool_registry(rebuilt_tools)
         cmd_context["tools"] = rebuilt_tools
 
-    # Create execution context for commands
-    cmd_context = {
-        "agent": agent,
-        "mcp_manager": mcp_manager,
-        "tools": tools,
-        "skill_manager": skill_manager,
-        "session_context": context,
-        "subagent_manager": subagent_manager,
-    }
     session_runtime = SessionRuntimeController(
         session_context=context,
         agent=agent,
@@ -463,29 +501,27 @@ def main() -> None:
         subagent_manager=subagent_manager,
         apply_tool_profile=apply_tool_profile,
         logger=agent.logger,
+        runtime_config=runtime_config,
     )
     cmd_context["session_runtime_controller"] = session_runtime
 
-    # Extract command descriptions for completer
-    command_descriptions = {}
-    for cmd in registry.list_commands():
-        command_descriptions[cmd.name] = cmd.short_desc or cmd.description
-
-    # Get command names for completion
+    command_descriptions = {
+        cmd.name: cmd.short_desc or cmd.description
+        for cmd in registry.list_commands()
+    }
     command_names = registry.get_command_names()
 
     def build_idle_statusline():
-        """Build the idle prompt statusline from session state and default view settings."""
+        """Build the idle prompt statusline from session state."""
         return build_prompt_toolbar(
             context,
-            view_mode=config.ui.live_activity_mode,
+            view_mode=runtime_config.ui.live_activity_mode,
         )
 
     def toggle_plan_mode() -> None:
         """Toggle the top-level session mode between build and plan."""
         session_runtime.toggle_plan_mode()
 
-    # Initialize input helper for bash-like editing with command completion
     input_helper = InputHelper(
         command_names=command_names,
         command_descriptions=command_descriptions,
@@ -503,54 +539,90 @@ def main() -> None:
         skill_debug=skill_debug,
     )
 
-    # Print banner
-    print_banner(console)
+    return AppRuntime(
+        runtime_config=runtime_config,
+        skill_debug=skill_debug,
+        enable_streaming=enable_streaming,
+        context=context,
+        skill_manager=skill_manager,
+        mcp_manager=mcp_manager,
+        subagent_manager=subagent_manager,
+        tools=tools,
+        agent=agent,
+        registry=registry,
+        cmd_context=cmd_context,
+        input_helper=input_helper,
+    )
 
-    # Main REPL loop
-    try:
-        while True:
-            try:
-                # Get user input with bash-like editing
-                user_input = input_helper.get_input("\nYou > ")
 
-                # CRITICAL: Ensure we're on a fresh line after prompt_toolkit
-                # This fixes the issue where subsequent responses don't display
-                print()
+def run_repl(console: Console, runtime: AppRuntime) -> None:
+    """Run the interactive CLI loop until exit."""
+    while True:
+        try:
+            user_input = runtime.input_helper.get_input("\nYou > ")
+            print()
 
-                if not user_input.strip():
-                    continue
+            if not user_input.strip():
+                continue
 
-                # Check for slash commands
-                if registry.execute(user_input, console, cmd_context):
-                    continue  # Command was handled
+            if runtime.registry.execute(user_input, console, runtime.cmd_context):
+                continue
 
-                if user_input.lower() in ['exit', 'quit']:
-                    console.print("\n[yellow]Goodbye![/yellow]")
-                    break
-
-                response = execute_user_turn(
-                    console,
-                    agent,
-                    user_input,
-                    enable_streaming=enable_streaming,
-                    skill_debug=skill_debug,
-                )
-
-            except KeyboardInterrupt:
-                console.print("\n\n[yellow]Interrupted. Type 'exit' to quit.[/yellow]")
-            except EOFError:
-                console.print("\n\n[yellow]Goodbye![/yellow]")
+            if user_input.lower() in ["exit", "quit"]:
+                console.print("\n[yellow]Goodbye![/yellow]")
                 break
-            except Exception as e:
-                console.print(f"\n[red]Error: {e}[/red]")
-    finally:
-        # Ensure logger is closed and logs are flushed
-        if hasattr(agent, 'logger') and agent.logger:
-            agent.logger.close()
 
-        # Close MCP server connections
-        if mcp_manager:
-            mcp_manager.close_all()
+            execute_user_turn(
+                console,
+                runtime.agent,
+                user_input,
+                enable_streaming=runtime.enable_streaming,
+                skill_debug=runtime.skill_debug,
+            )
+        except KeyboardInterrupt:
+            console.print("\n\n[yellow]Interrupted. Type 'exit' to quit.[/yellow]")
+        except EOFError:
+            console.print("\n\n[yellow]Goodbye![/yellow]")
+            break
+        except Exception as exc:
+            console.print(f"\n[red]Error: {exc}[/red]")
+
+
+def main() -> None:
+    """Main entry point."""
+    load_dotenv()
+    skill_debug = env_truthy("SKILL_DEBUG")
+    console = build_console()
+    runtime_config = load_runtime_config(console)
+
+    if skill_debug:
+        console.print("[dim][SKILL] Debug mode enabled[/dim]")
+
+    provider_error = validate_provider_config(runtime_config)
+    if provider_error:
+        console.print(f"[red]Error: {provider_error}[/red]\n")
+        sys.exit(1)
+
+    try:
+        runtime = build_agent_runtime(
+            console,
+            runtime_config,
+            Path.cwd(),
+            skill_debug=skill_debug,
+        )
+    except Exception as exc:
+        console.print(f"[red]Error initializing runtime: {exc}[/red]")
+        sys.exit(1)
+
+    print_banner(console, runtime_config)
+
+    try:
+        run_repl(console, runtime)
+    finally:
+        if hasattr(runtime.agent, "logger") and runtime.agent.logger:
+            runtime.agent.logger.close()
+        if runtime.mcp_manager:
+            runtime.mcp_manager.close_all()
 
 
 if __name__ == "__main__":

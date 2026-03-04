@@ -428,6 +428,65 @@ def test_run_subagents_uses_one_worker_per_accepted_request(monkeypatch, temp_di
     assert sum(1 for call in submit_calls if call[0] == "submit") == 3
 
 
+def test_run_subagents_respects_max_parallel(monkeypatch, temp_dir):
+    """Executor width should be capped by max_parallel even when more requests are accepted."""
+    monkeypatch.setattr("src.subagents.LLMClient", FakeChildLLM)
+
+    submit_calls = []
+
+    class TrackingExecutor:
+        def __init__(self, *, max_workers, thread_name_prefix):
+            submit_calls.append(("init", max_workers, thread_name_prefix))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            submit_calls.append(("submit", len(args)))
+            future = Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+    monkeypatch.setattr("src.subagents.ThreadPoolExecutor", TrackingExecutor)
+
+    context = Context.create(cwd=str(temp_dir))
+    skill_manager = SkillManager(repo_root=Path(temp_dir))
+    skill_manager.discover()
+    subagent_manager = SubagentManager(max_parallel=2, max_per_turn=5)
+    tools = build_tool_registry(
+        skill_manager=skill_manager,
+        subagent_manager=subagent_manager,
+        include_subagent_tool=True,
+    )
+    parent_logger = SessionLogger(context.session_id, log_dir=str(temp_dir), enabled=True)
+    parent_agent = Agent(
+        DummyParentLLM(),
+        tools,
+        context,
+        skill_manager=skill_manager,
+        logger=parent_logger,
+        subagent_manager=subagent_manager,
+    )
+
+    results = subagent_manager.run_subagents(
+        parent_agent,
+        [
+            SubagentRequest("a", "one", "", "", [], ""),
+            SubagentRequest("b", "two", "", "", [], ""),
+            SubagentRequest("c", "three", "", "", [], ""),
+            SubagentRequest("d", "four", "", "", [], ""),
+        ],
+        parent_turn_id=1,
+    )
+    parent_agent.logger.close()
+
+    assert [result.status for result in results] == ["completed", "completed", "completed", "completed"]
+    assert ("init", 2, "subagent") in submit_calls
+
+
 def test_run_subagents_rejects_overflow_requests_and_preserves_order(monkeypatch, temp_dir):
     """Requests beyond max_per_turn should be rejected after allowed requests keep their order."""
     monkeypatch.setattr("src.subagents.LLMClient", FakeChildLLM)

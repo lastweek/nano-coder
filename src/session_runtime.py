@@ -28,6 +28,7 @@ class SessionRuntimeController:
         subagent_manager=None,
         apply_tool_profile: Optional[Callable[[ToolProfile], None]] = None,
         logger=None,
+        runtime_config=None,
     ) -> None:
         self.session_context = session_context
         self.agent = agent
@@ -36,6 +37,7 @@ class SessionRuntimeController:
         self.subagent_manager = subagent_manager
         self.apply_tool_profile = apply_tool_profile
         self.logger = logger or getattr(agent, "logger", None)
+        self.runtime_config = runtime_config or config
 
     def activate_build_mode(self) -> None:
         """Switch the session back to normal build mode."""
@@ -54,7 +56,7 @@ class SessionRuntimeController:
             plan = create_session_plan(
                 self.session_context,
                 task=task or "Interactive planning session",
-                plan_dir=config.plan.plan_dir,
+                plan_dir=self.runtime_config.plan.plan_dir,
             )
 
         self.session_context.set_session_mode("plan")
@@ -63,7 +65,7 @@ class SessionRuntimeController:
 
     def toggle_plan_mode(self) -> None:
         """Toggle the top-level session mode between build and plan."""
-        if not config.plan.enabled:
+        if not self.runtime_config.plan.enabled:
             return
 
         if self.session_context.get_session_mode() == "plan":
@@ -77,7 +79,7 @@ class SessionRuntimeController:
         plan = create_session_plan(
             self.session_context,
             task=task,
-            plan_dir=config.plan.plan_dir,
+            plan_dir=self.runtime_config.plan.plan_dir,
         )
         self.session_context.set_session_mode("plan")
         self._apply_tool_profile(ToolProfile.PLAN_MAIN)
@@ -163,6 +165,7 @@ class SessionRuntimeController:
             subagent_manager=self.subagent_manager,
             include_subagent_tool=True,
             tool_profile=tool_profile,
+            runtime_config=self.runtime_config,
         )
         self.agent.set_tool_registry(rebuilt_tools)
 

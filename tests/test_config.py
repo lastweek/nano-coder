@@ -50,6 +50,7 @@ class TestConfigDefaults:
         monkeypatch.delenv("SUBAGENTS_ENABLED", raising=False)
         config = Config()
         assert config.subagents.enabled is True
+        assert config.subagents.max_parallel == 3
         assert config.subagents.max_per_turn == 6
         assert config.subagents.default_timeout_seconds == 180
 
@@ -188,3 +189,9 @@ class TestConfigEnvOverrides:
         monkeypatch.setenv("AGENT_MAX_ITERATIONS", "20")
         config = Config()
         assert config.agent.max_iterations == 20
+
+    def test_max_parallel_env_override(self, monkeypatch):
+        """Test SUBAGENTS_MAX_PARALLEL env variable override."""
+        monkeypatch.setenv("SUBAGENTS_MAX_PARALLEL", "4")
+        config = Config()
+        assert config.subagents.max_parallel == 4

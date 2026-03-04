@@ -112,6 +112,30 @@ def test_print_banner_minimal_config(monkeypatch):
     print_banner(console)
 
 
+def test_config_reload_is_silent(monkeypatch, capsys):
+    """Config reload should not print directly during import/runtime loading."""
+    monkeypatch.setenv("NANO_CODER_TEST", "true")
+    from src.config import Config
+
+    Config.reload()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_load_runtime_config_prints_diagnostics_via_console(monkeypatch):
+    """Bootstrap should surface config load diagnostics through the CLI console."""
+    from src.main import load_runtime_config
+
+    monkeypatch.setenv("NANO_CODER_TEST", "true")
+    console = make_recording_console()
+    runtime_config = load_runtime_config(console)
+
+    assert runtime_config is not None
+    rendered = normalize_output(console.export_text())
+    assert "Test mode: Skipping config.yaml" in rendered
+
+
 def test_display_metrics_streaming_single_call_shows_ttft_and_tpot():
     """Single streaming calls should continue showing both TTFT and TPOT."""
     from src.main import display_metrics, REQUEST_TYPE_STREAMING

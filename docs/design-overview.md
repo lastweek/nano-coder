@@ -144,6 +144,8 @@ The SessionLogger writes per-session logs to disk for debugging and analysis.
 - `artifacts/`: Spilled large payloads
 - `subagents/`: Nested child-agent session directories
 
+The logger now delegates timeline formatting and async write transport to small helper modules so `SessionLogger` stays focused on session state, manifest updates, and event lifecycle recording.
+
 ## Section 3: The Main Agent Loop (ReAct Pattern)
 
 The agent follows a ReAct (Reasoning + Acting) pattern that iterates between thinking and acting until it reaches a final answer.

@@ -1,6 +1,5 @@
 """Centralized configuration for Nano-Coder."""
 
-import os
 from typing import Optional, List, Literal
 from pathlib import Path
 import yaml
@@ -126,6 +125,7 @@ class SubagentConfig(BaseSettings):
     )
 
     enabled: bool = Field(default=True)
+    max_parallel: int = Field(default=3, ge=1)
     max_per_turn: int = Field(default=6, ge=1)
     default_timeout_seconds: int = Field(default=180, ge=1)
 
@@ -185,6 +185,7 @@ class Config:
 
     _instance: Optional['Config'] = None
     _config_path: Path = Path("config.yaml")
+    _last_load_messages: List[str] = []
 
     def __init__(self, config_dict: Optional[dict] = None):
         """Initialize all config sections.
@@ -297,10 +298,9 @@ class Config:
         if cls._instance is not None:
             return cls._instance
 
-        import os
-
         # Load from config.yaml if it exists and not in test mode
         config_dict = {}
+        load_messages: List[str] = []
         if config_path:
             cls._config_path = Path(config_path)
 
@@ -311,19 +311,22 @@ class Config:
             try:
                 with open(cls._config_path) as f:
                     config_dict = yaml.safe_load(f) or {}
-                print(f"Loaded configuration from {cls._config_path}")
+                load_messages.append(f"Loaded configuration from {cls._config_path}")
             except Exception as e:
-                print(f"Warning: Failed to load config from {cls._config_path}: {e}")
-                print("Using environment variables and defaults.")
+                load_messages.append(f"Warning: Failed to load config from {cls._config_path}: {e}")
+                load_messages.append("Using environment variables and defaults.")
         else:
             if is_test_mode:
-                print("Test mode: Skipping config.yaml, using environment variables and defaults.")
+                load_messages.append(
+                    "Test mode: Skipping config.yaml, using environment variables and defaults."
+                )
             else:
-                print(f"No config.yaml found at {cls._config_path}")
-                print("Using environment variables and defaults.")
+                load_messages.append(f"No config.yaml found at {cls._config_path}")
+                load_messages.append("Using environment variables and defaults.")
 
         # Create config instance (env vars will be applied by pydantic-settings)
         cls._instance = cls(config_dict)
+        cls._last_load_messages = load_messages
 
         return cls._instance
 
@@ -343,6 +346,11 @@ class Config:
         global config
         config = new_instance
         return new_instance
+
+    @classmethod
+    def get_load_messages(cls) -> List[str]:
+        """Return the diagnostic messages captured during the most recent load."""
+        return list(cls._last_load_messages)
 
 
 # Global config instance

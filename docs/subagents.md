@@ -323,6 +323,8 @@ graph TB
 | `max_per_turn` | 6 | Maximum subagents per parent turn |
 | `default_timeout_seconds` | 180 | Per-subagent timeout |
 
+`max_parallel` is enforced directly at executor construction time with `min(self.max_parallel, len(prepared_subagent_runs))`, so accepted requests can still exceed concurrency while running in bounded waves.
+
 **Capacity Reservation:**
 
 The `_reserve_turn_capacity()` method implements atomic capacity tracking:

@@ -3,6 +3,7 @@
 import pytest
 import importlib
 import sys
+from unittest.mock import Mock, patch
 from src.llm import LLMClient
 
 
@@ -88,3 +89,23 @@ class TestLLMClient:
         assert client._get_api_key_env_var("openai") == "OPENAI_API_KEY"
         assert client._get_api_key_env_var("azure") == "AZURE_API_KEY"
         assert client._get_api_key_env_var("custom") == "CUSTOM_API_KEY"
+
+    def test_stream_tool_calls_preserve_model_index_order(self, monkeypatch):
+        """Streamed tool calls should be returned in the original tool index order."""
+        monkeypatch.setenv("NANO_CODER_TEST", "true")
+        self._reload_config_and_modules()
+        client = LLMClient(provider="ollama")
+
+        tool_call_a = Mock(index=0, id="call_b")
+        tool_call_a.function = Mock(name="read_file", arguments='{"file_path":"a.txt"}')
+        tool_call_b = Mock(index=1, id="call_a")
+        tool_call_b.function = Mock(name="read_file", arguments='{"file_path":"b.txt"}')
+        mock_chunks = [
+            Mock(choices=[Mock(delta=Mock(role="assistant", content=None, tool_calls=[tool_call_b, tool_call_a]), finish_reason=None)], usage=None),
+            Mock(choices=[Mock(delta=Mock(role=None, content=None, tool_calls=None), finish_reason="tool_calls")], usage=None),
+        ]
+
+        with patch.object(client.client.chat.completions, "create", return_value=iter(mock_chunks)):
+            list(client.chat_stream([{"role": "user", "content": "inspect files"}]))
+
+        assert [tool_call["id"] for tool_call in client.get_stream_tool_calls()] == ["call_b", "call_a"]

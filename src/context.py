@@ -2,9 +2,10 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, List, Literal, Optional
 import uuid
 
+from src.message_types import ChatMessage
 from src.utils import resolve_path
 
 
@@ -36,8 +37,8 @@ class ConversationTurn:
     """A complete persisted conversation turn."""
 
     index: int
-    user_message: dict[str, Any]
-    assistant_message: dict[str, Any]
+    user_message: ChatMessage
+    assistant_message: ChatMessage
 
 
 @dataclass
@@ -61,7 +62,7 @@ class Context:
     """Session context passed to all operations."""
     cwd: Path
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    messages: List[Dict[str, Any]] = field(default_factory=list)
+    messages: List[ChatMessage] = field(default_factory=list)
     active_skills: List[str] = field(default_factory=list)
     summary: Optional[CompactedContextSummary] = None
     last_prompt_tokens: Optional[int] = None
@@ -81,7 +82,7 @@ class Context:
         """Add a message to the conversation history."""
         self.messages.append({"role": role, "content": content})
 
-    def get_messages(self) -> List[Dict[str, Any]]:
+    def get_messages(self) -> List[ChatMessage]:
         """Get all messages in the conversation history."""
         return self.messages
 
@@ -171,7 +172,7 @@ class Context:
         """Replace the current rolling summary."""
         self.summary = summary
 
-    def get_summary_message(self) -> Optional[Dict[str, Any]]:
+    def get_summary_message(self) -> Optional[ChatMessage]:
         """Return the synthetic assistant summary message for the next call."""
         if self.summary is None or not self.summary.rendered_text:
             return None
@@ -183,7 +184,7 @@ class Context:
         prefix_message_count = len(complete_turns) * 2
         malformed_tail = self.messages[prefix_message_count:]
 
-        new_messages: List[Dict[str, Any]] = []
+        new_messages: List[ChatMessage] = []
         for turn in retained_turns:
             new_messages.append(dict(turn.user_message))
             new_messages.append(dict(turn.assistant_message))

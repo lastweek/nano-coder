@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
 
 from src.activity_preview import build_tool_result_preview
+from src.message_types import ChatMessage, ToolCallPayload, ToolResultPayload
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,7 @@ class _ResolvedSubagentToolCall:
 
     tool_call_id: str
     request: Any | None = None
-    error_payload: Dict[str, Any] | None = None
+    error_payload: ToolResultPayload | None = None
 
 
 class AgentToolRuntime:
@@ -38,7 +39,7 @@ class AgentToolRuntime:
         logger,
         subagent_manager,
         get_tool: Callable[[str], Any],
-        build_tool_result_message: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+        build_tool_result_message: Callable[[str, ToolResultPayload], ChatMessage],
         parse_tool_arguments_for_logging: Callable[[str], Dict[str, Any]],
         emit_turn_event: Callable[..., None],
         emit_skill_event: Callable[..., None],
@@ -55,9 +56,9 @@ class AgentToolRuntime:
 
     def execute_standard_tool_call(
         self,
-        tool_call: Dict[str, Any],
+        tool_call: ToolCallPayload,
         parsed_args: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[ChatMessage, ToolResultPayload]:
         """Execute one ordinary tool call and build the tool-result message."""
         tool_name = tool_call["name"]
         tool_id = tool_call["id"]
@@ -82,7 +83,7 @@ class AgentToolRuntime:
     def execute_submit_plan_tool(
         self,
         parsed_args: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    ) -> ToolResultPayload:
         """Execute submit_plan and return the raw control-plane payload."""
         tool = self.get_tool("submit_plan")
         if tool is None:
@@ -101,9 +102,9 @@ class AgentToolRuntime:
 
     def process_subagent_batch(
         self,
-        tool_calls: List[Dict[str, Any]],
+        tool_calls: List[ToolCallPayload],
         *,
-        messages: List[Dict[str, Any]],
+        messages: List[ChatMessage],
         turn_id: int,
         iteration: int,
         on_tool_call: Optional[Callable],
@@ -216,9 +217,9 @@ class AgentToolRuntime:
 
     def process_tool_calls(
         self,
-        tool_calls: List[Dict[str, Any]],
+        tool_calls: List[ToolCallPayload],
         *,
-        messages: List[Dict[str, Any]],
+        messages: List[ChatMessage],
         turn_id: int,
         iteration: int,
         on_tool_call: Optional[Callable] = None,
@@ -236,7 +237,7 @@ class AgentToolRuntime:
             raw_arguments = current_tool_call["arguments"]
 
             if tool_name == "run_subagent":
-                subagent_batch: List[Dict[str, Any]] = []
+                subagent_batch: List[ToolCallPayload] = []
                 while index < len(tool_calls) and tool_calls[index]["name"] == "run_subagent":
                     subagent_batch.append(tool_calls[index])
                     index += 1
@@ -292,62 +293,19 @@ class AgentToolRuntime:
                 tool_call_id=tool_call_id,
             )
 
-            try:
-                decoded_arguments = json.loads(raw_arguments)
-            except json.JSONDecodeError as exc:
-                result_content = {"error": f"Invalid JSON in tool arguments: {exc}"}
-                tool_result_message = self.build_tool_result_message(tool_call_id, result_content)
-                messages.append(tool_result_message)
-                duration_s = perf_counter() - started_at
-                self.logger.log_tool_result(
+            decoded_arguments, decode_error = self._decode_tool_arguments(raw_arguments)
+            if decode_error is not None:
+                self._record_tool_completion(
+                    messages=messages,
                     turn_id=turn_id,
                     iteration=iteration,
                     tool_name=tool_name,
-                    result=result_content,
                     tool_call_id=tool_call_id,
-                )
-                result_preview, result_body = build_tool_result_preview(tool_name, result_content)
-                self.emit_turn_event(
-                    on_event,
-                    "tool_call_finished",
-                    iteration=iteration,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                    arguments=logging_arguments,
-                    success=False,
-                    duration_s=duration_s,
-                    error=result_content.get("error"),
-                    result_preview=result_preview,
-                    result_body=result_body,
-                )
-                index += 1
-                continue
-
-            if not isinstance(decoded_arguments, dict):
-                result_content = {"error": "Tool arguments must decode to a JSON object"}
-                tool_result_message = self.build_tool_result_message(tool_call_id, result_content)
-                messages.append(tool_result_message)
-                duration_s = perf_counter() - started_at
-                self.logger.log_tool_result(
-                    turn_id=turn_id,
-                    iteration=iteration,
-                    tool_name=tool_name,
-                    result=result_content,
-                    tool_call_id=tool_call_id,
-                )
-                result_preview, result_body = build_tool_result_preview(tool_name, result_content)
-                self.emit_turn_event(
-                    on_event,
-                    "tool_call_finished",
-                    iteration=iteration,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                    arguments=logging_arguments,
-                    success=False,
-                    duration_s=duration_s,
-                    error=result_content.get("error"),
-                    result_preview=result_preview,
-                    result_body=result_body,
+                    logging_arguments=logging_arguments,
+                    result_content=decode_error,
+                    duration_s=perf_counter() - started_at,
+                    on_event=on_event,
+                    append_message=True,
                 )
                 index += 1
                 continue
@@ -356,29 +314,19 @@ class AgentToolRuntime:
 
             if tool_name == "submit_plan":
                 result_content = self.execute_submit_plan_tool(parsed_args)
-                self.logger.log_tool_result(
+                self._record_tool_completion(
+                    messages=messages,
                     turn_id=turn_id,
                     iteration=iteration,
                     tool_name=tool_name,
-                    result=result_content,
                     tool_call_id=tool_call_id,
-                )
-                result_preview, result_body = build_tool_result_preview(tool_name, result_content)
-                self.emit_turn_event(
-                    on_event,
-                    "tool_call_finished",
-                    iteration=iteration,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                    arguments=logging_arguments,
-                    success="error" not in result_content,
+                    logging_arguments=logging_arguments,
+                    result_content=result_content,
                     duration_s=0.0,
-                    error=result_content.get("error"),
-                    result_preview=result_preview,
-                    result_body=result_body,
+                    on_event=on_event,
+                    append_message="error" in result_content,
                 )
                 if "error" in result_content:
-                    messages.append(self.build_tool_result_message(tool_call_id, result_content))
                     index += 1
                     continue
 
@@ -416,28 +364,17 @@ class AgentToolRuntime:
 
             tool_result_message, result_content = self.execute_standard_tool_call(current_tool_call, parsed_args)
             messages.append(tool_result_message)
-            duration_s = perf_counter() - started_at
-
-            self.logger.log_tool_result(
+            self._record_tool_completion(
+                messages=messages,
                 turn_id=turn_id,
                 iteration=iteration,
                 tool_name=tool_name,
-                result=result_content,
                 tool_call_id=tool_call_id,
-            )
-            result_preview, result_body = build_tool_result_preview(tool_name, result_content)
-            self.emit_turn_event(
-                on_event,
-                "tool_call_finished",
-                iteration=iteration,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                arguments=logging_arguments,
-                success="error" not in result_content,
-                duration_s=duration_s,
-                error=result_content.get("error"),
-                result_preview=result_preview,
-                result_body=result_body,
+                logging_arguments=logging_arguments,
+                result_content=result_content,
+                duration_s=perf_counter() - started_at,
+                on_event=on_event,
+                append_message=False,
             )
             if tool_name == "load_skill":
                 skill_event_name = "tool_load_succeeded"
@@ -476,3 +413,58 @@ class AgentToolRuntime:
             index += 1
 
         return ToolBatchOutcome(processed_count=processed_count)
+
+    def _decode_tool_arguments(
+        self,
+        raw_arguments: str,
+    ) -> tuple[Dict[str, Any] | None, ToolResultPayload | None]:
+        """Decode tool arguments into a JSON object or a standard error payload."""
+        try:
+            decoded_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            return None, {"error": f"Invalid JSON in tool arguments: {exc}"}
+
+        if not isinstance(decoded_arguments, dict):
+            return None, {"error": "Tool arguments must decode to a JSON object"}
+
+        return decoded_arguments, None
+
+    def _record_tool_completion(
+        self,
+        *,
+        messages: List[ChatMessage],
+        turn_id: int,
+        iteration: int,
+        tool_name: str,
+        tool_call_id: str,
+        logging_arguments: Dict[str, Any],
+        result_content: ToolResultPayload,
+        duration_s: float,
+        on_event,
+        append_message: bool,
+    ) -> None:
+        """Log, optionally append, and emit the final event for one tool result."""
+        if append_message:
+            messages.append(self.build_tool_result_message(tool_call_id, result_content))
+
+        self.logger.log_tool_result(
+            turn_id=turn_id,
+            iteration=iteration,
+            tool_name=tool_name,
+            result=result_content,
+            tool_call_id=tool_call_id,
+        )
+        result_preview, result_body = build_tool_result_preview(tool_name, result_content)
+        self.emit_turn_event(
+            on_event,
+            "tool_call_finished",
+            iteration=iteration,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            arguments=logging_arguments,
+            success="error" not in result_content,
+            duration_s=duration_s,
+            error=result_content.get("error"),
+            result_preview=result_preview,
+            result_body=result_body,
+        )

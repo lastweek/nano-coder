@@ -31,6 +31,7 @@ context:
 
 subagents:
   enabled: true
+  max_parallel: 3
   max_per_turn: 6
   default_timeout_seconds: 180
 

@@ -482,3 +482,29 @@ class TestSessionLogger:
         ]
         assert events[0]["kind"] == "session_started"
         assert events[-1]["kind"] == "session_completed"
+
+    def test_async_mode_uses_transport_and_flushes_on_close(self, temp_dir, monkeypatch):
+        """Async mode should submit writes through the transport and close it cleanly."""
+        submit_calls = []
+        close_timeouts = []
+
+        class TrackingTransport:
+            def __init__(self, on_error):
+                self.on_error = on_error
+
+            def submit(self, func, *args, **kwargs):
+                submit_calls.append(func.__name__)
+                func(*args, **kwargs)
+
+            def close(self, *, timeout):
+                close_timeouts.append(timeout)
+
+        monkeypatch.setattr("src.logger.AsyncWriteTransport", TrackingTransport)
+
+        logger = self._build_logger(temp_dir, async_mode=True)
+        turn_id = logger.start_turn(raw_user_input="hi", normalized_user_input="hi")
+        logger.finish_turn(turn_id, "hello", [], status="completed")
+        logger.close()
+
+        assert submit_calls
+        assert close_timeouts == [5.0]

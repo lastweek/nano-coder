@@ -115,6 +115,7 @@ def build_tool_registry(
     subagent_manager=None,
     include_subagent_tool: bool = True,
     tool_profile: ToolProfile = ToolProfile.BUILD,
+    runtime_config=None,
 ) -> ToolRegistry:
     """Build the standard tool registry for a parent or child agent."""
     from src.config import config
@@ -127,6 +128,7 @@ def build_tool_registry(
     from src.tools.subagent import RunSubagentTool
     from src.tools.write import WriteTool
 
+    runtime_config = runtime_config or config
     registry = ToolRegistry()
     registry.register(ReadTool())
     registry.register(LoadSkillTool(skill_manager))
@@ -136,7 +138,7 @@ def build_tool_registry(
         registry.register(BashTool())
         if mcp_manager is not None:
             mcp_manager.register_tools(registry)
-        if include_subagent_tool and subagent_manager is not None and config.subagents.enabled:
+        if include_subagent_tool and subagent_manager is not None and runtime_config.subagents.enabled:
             registry.register(RunSubagentTool(subagent_manager))
         return registry
 
@@ -155,8 +157,8 @@ def build_tool_registry(
         if (
             include_subagent_tool
             and subagent_manager is not None
-            and config.subagents.enabled
-            and config.plan.allow_subagents
+            and runtime_config.subagents.enabled
+            and runtime_config.plan.allow_subagents
         ):
             registry.register(RunSubagentTool(subagent_manager))
         return registry

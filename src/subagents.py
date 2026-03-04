@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
@@ -112,11 +113,15 @@ class SubagentManager:
         self,
         *,
         enabled: Optional[bool] = None,
+        max_parallel: Optional[int] = None,
         max_per_turn: Optional[int] = None,
         default_timeout_seconds: Optional[int] = None,
+        runtime_config=None,
     ) -> None:
-        cfg = config.subagents
+        self.runtime_config = runtime_config or config
+        cfg = self.runtime_config.subagents
         self.enabled = enabled if enabled is not None else cfg.enabled
+        self.max_parallel = max_parallel if max_parallel is not None else cfg.max_parallel
         self.max_per_turn = max_per_turn if max_per_turn is not None else cfg.max_per_turn
         self.default_timeout_seconds = (
             default_timeout_seconds
@@ -351,7 +356,7 @@ class SubagentManager:
         results_by_id: dict[str, SubagentResult] = {}
         future_map: dict[object, tuple[_PreparedSubagentRun, float]] = {}
 
-        max_workers = max(len(prepared_subagent_runs), 1)
+        max_workers = min(self.max_parallel, max(len(prepared_subagent_runs), 1))
         with ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="subagent",
@@ -512,6 +517,7 @@ class SubagentManager:
             parent_turn_id=parent_turn_id,
             subagent_id=subagent_id,
             subagent_label=label,
+            runtime_config=parent_agent.runtime_config,
         )
         parent_llm = parent_agent.llm
         child_logger.start_session(
@@ -532,10 +538,15 @@ class SubagentManager:
     ):
         """Create a fresh child agent with inherited normal tools and a fresh context."""
         parent_llm = parent_agent.llm
+        llm_kwargs = {
+            "provider": getattr(parent_llm, "provider", None),
+            "model": getattr(parent_llm, "model", None),
+            "base_url": getattr(parent_llm, "base_url", None),
+        }
+        if "runtime_config" in inspect.signature(LLMClient).parameters:
+            llm_kwargs["runtime_config"] = parent_agent.runtime_config
         child_llm = LLMClient(
-            provider=getattr(parent_llm, "provider", None),
-            model=getattr(parent_llm, "model", None),
-            base_url=getattr(parent_llm, "base_url", None),
+            **llm_kwargs,
         )
         excluded_tools = set()
         if child_context.get_session_mode() == "plan":
@@ -555,6 +566,7 @@ class SubagentManager:
             skill_manager=parent_agent.skill_manager,
             logger=child_logger,
             request_kind=REQUEST_KIND_SUBAGENT_TURN,
+            runtime_config=parent_agent.runtime_config,
         )
 
     def _finalize_subagent_run_record(

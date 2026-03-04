@@ -4,6 +4,7 @@ import os
 from typing import Optional, List, Dict, TYPE_CHECKING, Any
 from openai import OpenAI
 from src.config import config
+from src.message_types import ChatMessage, ToolCallPayload
 from src.tools import REQUEST_KIND_AGENT_TURN
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ class LLMClient:
         base_url: Optional[str] = None,
         provider: Optional[str] = None,
         logger: Optional['SessionLogger'] = None,
+        runtime_config=None,
     ):
         """Initialize the LLM client.
 
@@ -31,8 +33,9 @@ class LLMClient:
             provider: Provider name for env var lookup (defaults to LLM_PROVIDER env var)
             logger: Optional SessionLogger instance for logging requests/responses
         """
+        self.runtime_config = runtime_config or config
         # Determine provider
-        provider = provider or config.llm.provider
+        provider = provider or self.runtime_config.llm.provider
 
         # Get API key based on provider
         if api_key is None:
@@ -46,14 +49,14 @@ class LLMClient:
 
         # Get base URL
         if base_url is None:
-            base_url = config.llm.base_url
+            base_url = self.runtime_config.llm.base_url
             # Set default URLs for known providers
             if not base_url and provider == "ollama":
                 base_url = "http://localhost:11434/v1"
 
         # Get model name with provider defaults
         if model is None:
-            model = config.llm.model
+            model = self.runtime_config.llm.model
             if not model:
                 model = self._get_default_model(provider)
 
@@ -85,7 +88,7 @@ class LLMClient:
             return env_key
 
         # Fall back to config.yaml
-        return config.llm.api_key
+        return self.runtime_config.llm.api_key
 
     def _get_api_key_env_var(self, provider: str) -> str:
         """Get the environment variable name for API key."""
@@ -107,7 +110,7 @@ class LLMClient:
         }
         return defaults.get(provider, "gpt-4")
 
-    def _estimate_prompt_tokens(self, messages: List[Dict]) -> int:
+    def _estimate_prompt_tokens(self, messages: List[ChatMessage]) -> int:
         """Estimate prompt tokens from messages.
 
         Uses a rough character-based estimate (char_count / 4) as a fallback
@@ -152,7 +155,7 @@ class LLMClient:
 
     def _build_chat_kwargs(
         self,
-        messages: List[Dict],
+        messages: List[ChatMessage],
         tools: Optional[List[Dict]] = None,
         stream: bool = False
     ) -> Dict:
@@ -332,7 +335,7 @@ class LLMClient:
 
     def chat(
         self,
-        messages: List[Dict],
+        messages: List[ChatMessage],
         tools: Optional[List[Dict]] = None,
         log_context: Optional[Dict[str, Any]] = None,
     ) -> tuple:
@@ -413,7 +416,7 @@ class LLMClient:
 
     def chat_stream(
         self,
-        messages: List[Dict],
+        messages: List[ChatMessage],
         tools: Optional[List[Dict]] = None,
         log_context: Optional[Dict[str, Any]] = None,
     ):
@@ -494,6 +497,7 @@ class LLMClient:
 
                     if index not in accumulated_tool_calls:
                         accumulated_tool_calls[index] = {
+                            "index": index,
                             "id": tool_call_chunk.id or f"call_{index}",
                             "name": "",
                             "arguments": ""
@@ -533,8 +537,14 @@ class LLMClient:
             self._current_metrics.total_tokens = self._current_metrics.prompt_tokens + self._current_metrics.completion_tokens
 
         # Log complete response
-        tool_calls_list = list(accumulated_tool_calls.values())
-        tool_calls_list.sort(key=lambda x: x["id"])  # Sort by id to maintain order
+        tool_calls_list = [
+            {
+                "id": tool_call["id"],
+                "name": tool_call["name"],
+                "arguments": tool_call["arguments"],
+            }
+            for _, tool_call in sorted(accumulated_tool_calls.items(), key=lambda item: item[0])
+        ]
 
         if self.logger and log_context:
             self.logger.log_llm_response(
@@ -561,7 +571,7 @@ class LLMClient:
         """Get metrics from the most recent stream request."""
         return getattr(self, '_current_metrics', None)
 
-    def get_stream_tool_calls(self) -> List[Dict]:
+    def get_stream_tool_calls(self) -> List[ToolCallPayload]:
         """Get tool calls from the most recent stream request.
 
         Returns:

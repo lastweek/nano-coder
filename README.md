@@ -264,6 +264,10 @@ Useful config knobs:
 - `logging.enabled`
 - `logging.async_mode`
 - `logging.log_dir`
+- `subagents.max_parallel`
+- `subagents.max_per_turn`
+
+`logging.async_mode` now routes session-log writes through a background transport while keeping the same on-disk log format. `subagents.max_parallel` caps concurrent child-agent threads independently from the per-turn delegation limit.
 
 ### MCP server config
 

@@ -92,7 +92,8 @@ def format_token_count(value: int | None) -> str:
 
 def build_context_usage_snapshot(agent, session_context, skill_manager=None) -> ContextUsageSnapshot:
     """Build a next-call baseline context usage snapshot."""
-    context_window = Config.load().llm.context_window
+    runtime_config = getattr(agent, "runtime_config", None) or Config.load()
+    context_window = runtime_config.llm.context_window
     system_prompt = getattr(agent, "_cached_system_prompt_base", "") or ""
     skill_catalog = ""
     if hasattr(agent, "_build_skill_catalog_section"):
@@ -205,12 +206,11 @@ def build_context_usage_snapshot(agent, session_context, skill_manager=None) -> 
                 )
             )
 
-    current_config = Config.load()
     notes = ["Baseline excludes the next user message and any explicit $skill preloads."]
     notes.append(
         "Auto-compaction triggers at "
-        f"{current_config.context.auto_compact_threshold * 100:.0f}% and targets "
-        f"{current_config.context.target_usage_after_compaction * 100:.0f}% usage after compaction."
+        f"{runtime_config.context.auto_compact_threshold * 100:.0f}% and targets "
+        f"{runtime_config.context.target_usage_after_compaction * 100:.0f}% usage after compaction."
     )
     if compacted_summary_message is not None:
         notes.append("Recent messages exclude any turns already compacted into the rolling summary.")

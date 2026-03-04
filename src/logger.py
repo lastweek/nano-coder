@@ -4,63 +4,31 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Lock, Thread
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
 from src.config import config
+from src.logger_format import (
+    ARTIFACT_SPILL_THRESHOLD,
+    SECTION_RULE,
+    SESSION_HEADER_RULE,
+    UUID_TRUNC_LENGTH,
+    append_json_block,
+    append_text_block,
+    pretty_json,
+    render_timeline_block,
+    serialize_payload,
+)
+from src.logger_transport import AsyncWriteTransport
+from src.logger_types import SessionLogSnapshot, TurnState, sanitize_fragment
 from src.tools import (
     REQUEST_KIND_AGENT_TURN,
     REQUEST_KIND_CONTEXT_COMPACTION,
     REQUEST_KIND_PLAN_TURN,
 )
 from src.utils import env_truthy
-
-
-# Constants for formatting and display
-SESSION_HEADER_RULE = "=" * 80
-SECTION_RULE = "-" * 80
-ARTIFACT_SPILL_THRESHOLD = 8192
-
-# ID formatting constants
-ID_PADDING_WIDTH = 4  # For step/turn numbers (:04d)
-ITERATION_PADDING_WIDTH = 2  # For iteration numbers (:02d)
-UUID_TRUNC_LENGTH = 8  # For truncating UUIDs in filenames
-
-
-def _sanitize_fragment(value: str) -> str:
-    """Convert a freeform label into a filesystem-safe fragment."""
-    return "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in value.strip()).strip("-") or "subagent"
-
-
-@dataclass
-class _TurnState:
-    """In-memory tracking for a single turn."""
-
-    turn_id: int
-    started_at: str
-    raw_user_input: str
-    normalized_user_input: str
-    llm_call_count: int = 0
-    tool_call_count: int = 0
-    tools_used: List[str] = field(default_factory=list)
-    skills_used: List[str] = field(default_factory=list)
-    status: str = "open"
-
-
-@dataclass(frozen=True)
-class SessionLogSnapshot:
-    """In-memory aggregate view of one logger session."""
-
-    session_dir: str
-    llm_log: str
-    events_log: str
-    llm_call_count: int
-    tool_call_count: int
-    tools_used: List[str]
 
 
 class SessionLogger:
@@ -79,12 +47,14 @@ class SessionLogger:
         parent_turn_id: Optional[int] = None,
         subagent_id: Optional[str] = None,
         subagent_label: Optional[str] = None,
+        runtime_config=None,
     ):
         """Initialize the logger."""
         self.session_id = session_id
+        self.runtime_config = runtime_config or config
 
         if log_dir is None:
-            log_dir = config.logging.log_dir
+            log_dir = self.runtime_config.logging.log_dir
         if enabled is None:
             # Check environment variable for explicit true/false
             env_value = os.environ.get("ENABLE_LOGGING", "").lower()
@@ -93,11 +63,11 @@ class SessionLogger:
             elif env_truthy("ENABLE_LOGGING"):
                 enabled = True
             else:
-                enabled = config.logging.enabled
+                enabled = self.runtime_config.logging.enabled
         if buffer_size is None:
-            buffer_size = config.logging.buffer_size
+            buffer_size = self.runtime_config.logging.buffer_size
         if async_mode is None:
-            async_mode = config.logging.async_mode
+            async_mode = self.runtime_config.logging.async_mode
 
         self.log_dir = Path(log_dir)
         self.enabled = enabled
@@ -113,8 +83,8 @@ class SessionLogger:
         self._lock = Lock()
         self._timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         if self.session_kind == "subagent":
-            label_fragment = _sanitize_fragment(self.subagent_label or "subagent")
-            id_fragment = _sanitize_fragment((self.subagent_id or self.session_id)[:UUID_TRUNC_LENGTH])
+            label_fragment = sanitize_fragment(self.subagent_label or "subagent")
+            id_fragment = sanitize_fragment((self.subagent_id or self.session_id)[:UUID_TRUNC_LENGTH])
             self._session_dir_name = f"subagent-{label_fragment}-{id_fragment}"
         else:
             self._session_dir_name = f"session-{self._timestamp}-{self.session_id[:UUID_TRUNC_LENGTH]}"
@@ -144,15 +114,12 @@ class SessionLogger:
         self._session_tools_used: List[str] = []
         self._skill_event_count = 0
         self._error_count = 0
-        self._turns: Dict[int, _TurnState] = {}
+        self._turns: Dict[int, TurnState] = {}
         self._session_footer_written = False
 
-        self._queue: Optional[Queue] = None
-        self._writer_thread: Optional[Thread] = None
-        self._stop_requested = False
+        self._transport: AsyncWriteTransport | None = None
         if self.enabled and self.async_mode:
-            self._queue = Queue()
-            self._start_writer_thread()
+            self._transport = AsyncWriteTransport(self._write_fallback_error)
 
     def start_session(
         self,
@@ -185,7 +152,7 @@ class SessionLogger:
 
         self._turn_counter += 1
         turn_id = self._turn_counter
-        turn_state = _TurnState(
+        turn_state = TurnState(
             turn_id=turn_id,
             started_at=datetime.now().isoformat(),
             raw_user_input=raw_user_input,
@@ -426,15 +393,22 @@ class SessionLogger:
         self._session_ended_at = datetime.now().isoformat()
         self._session_status = status
 
-        if self._initialized:
+        should_finalize = self._initialized or any(
+            (
+                self._turn_counter,
+                self._llm_call_count,
+                self._tool_call_count,
+                self._skill_event_count,
+                self._error_count,
+            )
+        )
+        if should_finalize:
             self._submit_write(self._record_session_completed)
             self._submit_write(self._write_session_manifest)
 
-        if self.async_mode and self._queue is not None and self._writer_thread is not None:
-            self._stop_requested = True
-            self._queue.put(None)
-            self._writer_thread.join(timeout=5.0)
-            self._writer_thread = None
+        if self.async_mode and self._transport is not None:
+            self._transport.close(timeout=5.0)
+            self._transport = None
 
     def __enter__(self) -> "SessionLogger":
         return self
@@ -442,31 +416,13 @@ class SessionLogger:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close(status="error" if exc_type is not None else "completed")
 
-    def _start_writer_thread(self) -> None:
-        """Start the async writer thread."""
-
-        def writer() -> None:
-            while True:
-                try:
-                    item = self._queue.get(timeout=0.1)
-                except Empty:
-                    continue
-
-                if item is None:
-                    break
-
-                try:
-                    func, args, kwargs = item
-                    func(*args, **kwargs)
-                except Exception:
-                    self._write_fallback_error("logger.async_writer", "Writer thread error")
-
-        self._writer_thread = Thread(target=writer, daemon=True)
-        self._writer_thread.start()
-
     def _submit_write(self, func: Callable[..., None], *args: Any, **kwargs: Any) -> None:
         """Submit a write operation in-order."""
         if not self.enabled:
+            return
+
+        if self.async_mode and self._transport is not None:
+            self._transport.submit(func, *args, **kwargs)
             return
 
         func(*args, **kwargs)
@@ -633,11 +589,11 @@ class SessionLogger:
 
     def _append_json_block(self, label: str, payload: Any) -> List[str]:
         """Render a JSON block for llm.log."""
-        return [label, "<<<json", self._pretty_json(payload), ">>>", ""]
+        return append_json_block(label, payload)
 
     def _append_text_block(self, label: str, text: str) -> List[str]:
         """Render a text block for llm.log."""
-        return [label, "<<<", text or "", ">>>", ""]
+        return append_text_block(label, text)
 
     def _write_timeline_block(
         self,
@@ -649,13 +605,15 @@ class SessionLogger:
         sections: Optional[List[str]] = None,
     ) -> None:
         """Write a fully formatted timeline block to llm.log."""
-        lines = [rule, header, f"Timestamp: {timestamp}"]
-        if metadata_lines:
-            lines.extend(metadata_lines)
-        lines.extend([rule, ""])
-        if sections:
-            lines.extend(sections)
-        self._append_llm_log("".join(f"{line}\n" for line in lines))
+        self._append_llm_log(
+            render_timeline_block(
+                rule=rule,
+                header=header,
+                timestamp=timestamp,
+                metadata_lines=metadata_lines,
+                sections=sections,
+            )
+        )
 
     def _record_session_started(self) -> None:
         """Write the session start block and event."""
@@ -714,7 +672,7 @@ class SessionLogger:
         )
         self._session_footer_written = True
 
-    def _record_turn_started(self, turn_state: _TurnState) -> None:
+    def _record_turn_started(self, turn_state: TurnState) -> None:
         """Write turn start to both logs."""
         self._ensure_initialized()
         timestamp = datetime.now().isoformat()
@@ -1032,7 +990,7 @@ class SessionLogger:
 
     def _record_turn_completed(
         self,
-        turn_state: _TurnState,
+        turn_state: TurnState,
         final_response: str,
         metrics_summary: Dict[str, Any],
         error: Optional[Dict[str, Any]],
@@ -1141,13 +1099,11 @@ class SessionLogger:
 
     def _serialize_payload(self, payload: Any) -> str:
         """Serialize a payload for size checks."""
-        if isinstance(payload, str):
-            return payload
-        return self._pretty_json(payload)
+        return serialize_payload(payload)
 
     def _pretty_json(self, payload: Any) -> str:
         """Pretty-print JSON with stable formatting."""
-        return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        return pretty_json(payload)
 
     def _summarize_metrics(self, request_metrics: List[Any]) -> Dict[str, Any]:
         """Aggregate per-request metrics into a turn summary."""

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from src.config import Config
+from src.utils import calculate_percentage
 
 
 @dataclass(frozen=True)
@@ -242,9 +243,7 @@ def _json_dumps(payload: Any) -> str:
 
 def _percentage(value: int, total: int | None) -> float | None:
     """Compute percentage against the configured context window."""
-    if total in (None, 0):
-        return None
-    return (value / total) * 100
+    return calculate_percentage(value, total)
 
 
 def _build_message_preview(content: Any) -> str:

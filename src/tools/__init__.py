@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from src.context import Context
@@ -22,7 +23,23 @@ REQUEST_KIND_CONTEXT_COMPACTION = "context_compaction"
 REQUEST_KIND_PLAN_TURN = "plan_turn"
 REQUEST_KIND_SUBAGENT_TURN = "subagent_turn"
 
-ToolProfile = Literal["build", "plan_main", "plan_subagent", "build_subagent"]
+class ToolProfile(str, Enum):
+    """Tool profile names with type safety.
+
+    Different profiles control which tools are available to agents in different modes:
+    - BUILD: Full tool access for normal agent operation
+    - PLAN_MAIN: Planning mode tools for main agent
+    - PLAN_SUBAGENT: Planning mode tools for subagents (restricted)
+    - BUILD_SUBAGENT: Full tools for subagents
+    """
+
+    BUILD = "build"
+    PLAN_MAIN = "plan_main"
+    PLAN_SUBAGENT = "plan_subagent"
+    BUILD_SUBAGENT = "build_subagent"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass
@@ -97,7 +114,7 @@ def build_tool_registry(
     mcp_manager=None,
     subagent_manager=None,
     include_subagent_tool: bool = True,
-    tool_profile: ToolProfile = "build",
+    tool_profile: ToolProfile = ToolProfile.BUILD,
 ) -> ToolRegistry:
     """Build the standard tool registry for a parent or child agent."""
     from src.config import config
@@ -114,7 +131,7 @@ def build_tool_registry(
     registry.register(ReadTool())
     registry.register(LoadSkillTool(skill_manager))
 
-    if tool_profile == "build":
+    if tool_profile == ToolProfile.BUILD:
         registry.register(WriteTool())
         registry.register(BashTool())
         if mcp_manager is not None:
@@ -123,7 +140,7 @@ def build_tool_registry(
             registry.register(RunSubagentTool(subagent_manager))
         return registry
 
-    if tool_profile == "build_subagent":
+    if tool_profile == ToolProfile.BUILD_SUBAGENT:
         registry.register(WriteTool())
         registry.register(BashTool())
         if mcp_manager is not None:
@@ -132,7 +149,7 @@ def build_tool_registry(
 
     registry.register(ReadOnlyShellTool())
 
-    if tool_profile == "plan_main":
+    if tool_profile == ToolProfile.PLAN_MAIN:
         registry.register(WritePlanTool())
         registry.register(SubmitPlanTool())
         if (
@@ -144,7 +161,7 @@ def build_tool_registry(
             registry.register(RunSubagentTool(subagent_manager))
         return registry
 
-    if tool_profile == "plan_subagent":
+    if tool_profile == ToolProfile.PLAN_SUBAGENT:
         return registry
 
     return registry

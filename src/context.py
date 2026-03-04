@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 import uuid
 
+from src.utils import resolve_path
+
 
 SessionMode = Literal["build", "plan"]
 PlanStatus = Literal[
@@ -73,7 +75,7 @@ class Context:
     @classmethod
     def create(cls, cwd: str = ".") -> 'Context':
         """Create a new context with resolved working directory."""
-        return cls(cwd=Path(cwd).resolve())
+        return cls(cwd=resolve_path(cwd))
 
     def add_message(self, role: str, content: Any) -> None:
         """Add a message to the conversation history."""

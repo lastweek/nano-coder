@@ -1,19 +1,46 @@
 # Nano-Coder
 
-Nano-Coder is a terminal-based coding agent for working directly inside a repository. It combines an OpenAI-compatible LLM client with tool use for reading files, writing files, running shell commands, loading skills, and calling MCP servers from the same CLI session.
+Nano-Coder is a minimal terminal-based coding agent for working directly inside a repository. It combines an OpenAI-compatible LLM client with tool use for reading files, writing files, running shell commands, loading skills, and calling MCP servers from the same CLI session.
 
 The project is built for practical repo work: you get a live activity feed while the agent is running, structured per-session logs after each turn, and slash commands for inspecting tools, skills, MCP servers, and estimated context usage.
 
 ## Why Nano-Coder
 
-- Terminal-first workflow for staying in your shell and repository
-- Tool-based code tasks with `read_file`, `write_file`, and `run_command`
-- Streaming answers plus a live activity feed while the agent is thinking
-- MCP support for external tool servers such as DeepWiki
-- Local subagents for delegated repo tasks with a per-turn cap
-- Local skill system with cataloging, pinning, and on-demand loading
-- Per-session logging with `session.json`, `llm.log`, and `events.jsonl`
-- `/context` command for estimating next-call baseline context usage
+- **Terminal-first workflow** for staying in your shell and repository
+- **Tool-based code tasks** with `read_file`, `write_file`, and `run_command`
+- **Streaming answers** plus a live activity feed while the agent is thinking
+- **MCP support** for external tool servers such as DeepWiki
+- **Local subagents** for delegated repo tasks with bounded parallelism
+- **Local skill system** with cataloging, pinning, and on-demand loading
+- **Context compaction** for long-running sessions within finite context windows
+- **Per-session logging** with `session.json`, `llm.log`, and `events.jsonl`
+- **Slash commands** for inspecting tools, skills, MCP servers, and context usage
+
+## Technical Documentation
+
+For detailed technical information about Nano-Coder's architecture and components, see the [docs/](docs/) directory:
+
+- **[docs/design-overview.md](docs/design-overview.md)** - High-level system architecture, ReAct loop, and component integration
+- **[docs/subagents.md](docs/subagents.md)** - Parallel task delegation and child agent runtime
+- **[docs/skills.md](docs/skills.md)** - Skill system architecture, discovery, and loading mechanisms
+- **[docs/context-compaction.md](docs/context-compaction.md)** - Session compaction strategy and implementation
+
+## Project Progress
+
+Nano-Coder was built in short, feature-focused steps. The commit history shows a fairly clear progression from a minimal terminal agent into a more capable repo-workbench:
+
+| Date | Commit | Milestone |
+| --- | --- | --- |
+| 2026-02-28 | `52678b6` | First usable coding-agent baseline: ReAct loop, file/shell tools, secret guardrails, session logging, and initial tests. |
+| 2026-03-01 | `5e36830` | Centralized configuration and better metrics/logging: `config.yaml`, provider config, token metrics, and streaming-related test coverage. |
+| 2026-03-02 | `0a62f46` | Skills, slash commands, and MCP support: local `SKILL.md` bundles, command registry, input helper improvements, and MCP tool integration. |
+| 2026-03-02 | `8f3d822` | Better CLI observability: turn activity events, live display, `/context`, and stronger context/token inspection. |
+| 2026-03-02 | `51a233e` | Context compaction and session tooling: rolling summaries, `/compact`, and richer command help/manual behavior. |
+| 2026-03-03 | `c29eec1` | Local subagents: delegated child agents with nested logs, structured results, and non-recursive fan-out. |
+| 2026-03-03 | `c528803` | Technical documentation and upgraded turn UX: architecture docs, grouped live activity rendering, and improved turn controls. |
+| 2026-03-03 | `f6a4ba3` | First-class planning workflow: `/plan`, read-only planning tools, approved-plan execution contract, and persistent status line support. |
+
+Low-signal `Update` and `Fix` commits between these milestones are omitted here to keep the progression readable.
 
 ## Quickstart
 
@@ -78,23 +105,78 @@ Nano-Coder writes one session directory per CLI run, with `session.json` for met
 
 ### Built-in tools
 
-Nano-Coder ships with built-in tools for reading files, writing files, and running shell commands. The agent uses them through the same tool-calling loop as MCP tools and skills.
+Nano-Coder ships with built-in tools for reading files, writing files, and running shell commands. Tools are registered through a type-safe `ToolRegistry` system with profile-based access control. The agent uses them through the same tool-calling loop as MCP tools and skills.
+
+Available tools include:
+
+- `read_file` - Read file contents with optional line ranges
+- `write_file` - Create or modify files
+- `run_command` - Execute shell commands with configurable timeouts
+- `load_skill` - Load skill bundles on demand
+- `run_subagent` - Delegate tasks to child agents
+
+### Tool profiles
+
+The tool system uses type-safe `ToolProfile` enums to control tool availability:
+
+- `BUILD` - Full tool access for normal agent operation
+- `PLAN_MAIN` - Planning mode tools for main agent (read-only + plan tools)
+- `PLAN_SUBAGENT` - Restricted planning mode for subagents
+- `BUILD_SUBAGENT` - Full tools for subagents (no recursive delegation)
 
 ### MCP integration
 
-MCP servers are configured in `config.yaml` and loaded at startup. Their tools appear alongside built-in tools and can be inspected with `/mcp`.
+MCP servers are configured in `config.yaml` and loaded at startup. Their tools appear alongside built-in tools and can be inspected with `/mcp`. MCP tools participate through the same registry system as built-in tools.
 
 ### Skills
 
 Skills provide reusable local instructions through `SKILL.md` bundles. Nano-Coder keeps a compact skill catalog in context and loads full skill bodies only when they are pinned, explicitly requested with `$skill-name`, or loaded by the agent with `load_skill`.
 
+**Skill features:**
+
+- Discovery from `.nano-coder/skills/` and `~/.nano-coder/skills/`
+- YAML frontmatter with name, description, and metadata
+- Optional scripts, references, and assets directories
+- Pinning for session-wide availability
+- Token budget tracking for context management
+
 ### Subagents
 
-Nano-Coder can delegate independent repo subtasks to fresh local subagents with `run_subagent`. Child agents run in the same repository with their own context and nested session logs, but they do not inherit the parent conversation history or spawn additional subagents.
+Nano-Coder can delegate independent repo subtasks to fresh local subagents with `run_subagent`. Child agents run in isolated worker threads with their own context, LLM client, and nested session logs.
+
+**Subagent features:**
+
+- Bounded parallel fan-out with configurable worker limits
+- Isolated contexts (no conversation history inheritance)
+- No recursive delegation (subagents cannot spawn subagents)
+- Nested session logging under `logs/subagents/`
+- Result aggregation with structured error handling
+
+### Context compaction
+
+For long-running sessions, Nano-Coder can automatically compact older conversation turns into summaries while preserving recent context in raw form. This enables sessions that exceed the context window to continue operating efficiently.
+
+**Compaction features:**
+
+- Automatic trigger based on token thresholds
+- LLM-generated summaries of older turns
+- Configurable compaction ratio and retention strategy
+- Manual trigger via `/compact now`
+- Toggle automatic compaction with `/compact auto on/off`
 
 ### Logging
 
 Each CLI run creates a per-session log directory. `llm.log` is the primary human-readable execution timeline, `events.jsonl` is the structured companion log, and `session.json` stores session metadata and aggregate counts.
+
+**Log structure:**
+
+- `logs/session-{timestamp}/session.json` - Session metadata and aggregate counts
+- `logs/session-{timestamp}/llm.log` - Full human-readable execution timeline
+- `logs/session-{timestamp}/events.jsonl` - Structured event stream
+- `logs/session-{timestamp}/artifacts/` - Spilled large non-LLM payloads
+- `logs/session-{timestamp}/subagents/` - Nested child-agent session directories
+- `logs/latest-session` -> Symlink to most recent session
+- `logs/latest.log` -> Symlink to most recent llm.log
 
 ### Context inspection
 
@@ -238,7 +320,7 @@ Supported forms:
 - `/compact auto on`
 - `/compact auto off`
 
-For the full execution model, summary lifecycle, and logging flow, see [doc/context-compaction.md](doc/context-compaction.md).
+For the full execution model, summary lifecycle, and logging flow, see [docs/context-compaction.md](docs/context-compaction.md).
 
 ### `/context`
 
@@ -254,11 +336,15 @@ Supported forms:
 - `/subagent run <task>`
 - `/subagent show <id>`
 
+For details on subagent architecture, delegation patterns, and concurrency model, see [docs/subagents.md](docs/subagents.md).
+
 ## Skills
 
 ### What skills are
 
 Skills are local instruction bundles stored in `SKILL.md`. They let the agent or user bring in domain-specific workflows without putting the full instructions into every turn up front.
+
+For comprehensive documentation of the skill system architecture, discovery mechanisms, and loading patterns, see [docs/skills.md](docs/skills.md).
 
 ### Discovery roots
 
@@ -377,11 +463,43 @@ pytest
 pytest --cov=src --cov-report=html
 ```
 
+### Code style guidelines
+
+- Follow PEP 8 style guidelines
+- Use type hints for function signatures
+- Add docstrings to classes and public methods
+- Keep functions focused and small
+- Write tests first (TDD approach recommended)
+- Aim for >80% code coverage
+
+### Adding new features
+
+When adding new features to Nano-Coder:
+
+1. **Write tests first** - Create test files in `tests/` directory
+2. **Use shared utilities** - Leverage functions in `src/utils.py`
+3. **Follow existing patterns** - Check similar tools/components for patterns
+4. **Update documentation** - Add technical docs to `docs/` as needed
+5. **Register components** - Update registries and configuration as needed
+
+### Shared utilities
+
+The `src/utils.py` module provides reusable utility functions:
+
+- `env_truthy(var_name, default)` - Check if environment variable evaluates to truthy
+- `resolve_path(path, base)` - Resolve paths consistently with optional base directory
+- `calculate_percentage(value, total)` - Compute percentage with None-safe handling
+
+Use these utilities instead of implementing custom versions to maintain consistency across the codebase.
+
 ### Key directories
 
 ```text
 src/                core CLI, agent, config, logging, commands, and built-in tools
+src/tools/          built-in tool implementations (read, write, bash, etc.)
+src/commands/       slash command implementations
 tests/              pytest suite
+docs/               technical documentation
 .githooks/          local secret guard hooks
 .nano-coder/skills/ optional repo-local skills
 ```

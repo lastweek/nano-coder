@@ -12,16 +12,13 @@ class NonInteractiveInput:
         return False
 
 
-def test_handle_key_toggles_mode_detail_and_hint():
-    """The three live control keys should mutate display state."""
+def test_handle_key_toggles_mode_and_hint():
+    """The live control keys should mutate display state."""
     display = TurnProgressDisplay(live_activity_mode="simple", live_activity_details="collapsed")
     controls = LiveTurnControls(display, input_stream=NonInteractiveInput())
 
     assert controls.handle_key("v") is True
     assert display.live_state.mode == "verbose"
-
-    assert controls.handle_key("z") is True
-    assert display.live_state.detail_mode == "expanded"
 
     assert controls.handle_key("?") is True
     assert display.live_state.show_controls_hint is True
@@ -58,7 +55,6 @@ def test_controls_do_not_change_persisted_summary_content():
 
     controls = LiveTurnControls(display, input_stream=NonInteractiveInput())
     controls.handle_key("v")
-    controls.handle_key("z")
     controls.handle_key("?")
 
     assert display.summary_lines == before

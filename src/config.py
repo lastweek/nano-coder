@@ -1,10 +1,12 @@
 """Centralized configuration for Nano-Coder."""
 
+import os
 from typing import Optional, List, Literal
 from pathlib import Path
 import yaml
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from src.utils import env_truthy
 
 
 class LLMConfig(BaseSettings):
@@ -303,7 +305,7 @@ class Config:
             cls._config_path = Path(config_path)
 
         # Skip loading config.yaml in test mode (when NANO_CODER_TEST is set)
-        is_test_mode = os.environ.get("NANO_CODER_TEST", "").lower() == "true"
+        is_test_mode = env_truthy("NANO_CODER_TEST")
 
         if not is_test_mode and cls._config_path.exists():
             try:

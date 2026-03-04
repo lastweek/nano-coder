@@ -15,13 +15,6 @@ from src.commands.registry import (
 )
 from src.config import config
 from src.context_usage import build_context_usage_snapshot, format_token_count
-from src.plan_mode import (
-    build_plan_execution_message,
-    create_session_plan,
-    mark_plan_approved,
-    mark_plan_executing,
-    mark_plan_rejected,
-)
 
 
 def _get_skill_dependencies(console: Console, context: Any):
@@ -105,14 +98,12 @@ def _get_subagent_dependencies(console: Console, context: Any):
 
 def _get_plan_dependencies(console: Console, context: Any):
     """Get plan-workflow dependencies from command context."""
-    agent = context.get("agent")
-    session_context = context.get("session_context")
+    session_runtime = context.get("session_runtime_controller")
     run_agent_turn = context.get("run_agent_turn_callback")
-    set_tool_profile = context.get("set_tool_profile_callback")
-    if agent is None or session_context is None or run_agent_turn is None or set_tool_profile is None:
-        console.print("[red]Agent, session context, and plan callbacks are required for /plan[/red]")
-        return None, None, None, None
-    return agent, session_context, run_agent_turn, set_tool_profile
+    if session_runtime is None or run_agent_turn is None:
+        console.print("[red]Session runtime controller and turn callback are required for /plan[/red]")
+        return None, None
+    return session_runtime, run_agent_turn
 
 
 def _prompt_for_plan_decision(console: Console, context: Any) -> Optional[bool]:
@@ -612,14 +603,10 @@ def register_all(registry):
     )
     def cmd_plan(console: Console, args: str, context: Any):
         """Start, inspect, or apply the session-local planning workflow."""
-        agent, session_context, run_agent_turn_callback, set_tool_profile_callback = _get_plan_dependencies(console, context)
-        if (
-            agent is None
-            or session_context is None
-            or run_agent_turn_callback is None
-            or set_tool_profile_callback is None
-        ):
+        session_runtime, run_agent_turn_callback = _get_plan_dependencies(console, context)
+        if session_runtime is None or run_agent_turn_callback is None:
             return
+        session_context = session_runtime.session_context
 
         if not config.plan.enabled:
             console.print("[yellow]Plan mode is disabled in the current configuration[/yellow]")
@@ -659,23 +646,7 @@ def register_all(registry):
                     render_command_help(console, command, "start")
                 return
 
-            session_context.set_session_mode("plan")
-            plan = create_session_plan(
-                session_context,
-                task=remainder,
-                plan_dir=config.plan.plan_dir,
-            )
-            set_tool_profile_callback("plan_main")
-            logger = getattr(agent, "logger", None)
-            if logger is not None:
-                logger.log_plan_event(
-                    turn_id=None,
-                    stage="started",
-                    plan_id=plan.plan_id,
-                    status=plan.status,
-                    file_path=plan.file_path,
-                    task=plan.task,
-                )
+            plan = session_runtime.start_planning(remainder)
 
             console.print(Panel(
                 f"[bold]Planning task:[/bold] {plan.task}\n[bold]Plan file:[/bold] {plan.file_path}",
@@ -687,8 +658,7 @@ def register_all(registry):
             submitted_plan = session_context.get_current_plan()
             if submitted_plan is None:
                 console.print("[yellow]Planning finished without creating a plan artifact[/yellow]")
-                session_context.set_session_mode("build")
-                set_tool_profile_callback("build")
+                session_runtime.exit_plan_mode()
                 return
 
             if submitted_plan.status != "ready_for_review":
@@ -704,49 +674,20 @@ def register_all(registry):
 
             decision = _prompt_for_plan_decision(console, context)
             if decision is None:
-                session_context.set_session_mode("build")
-                set_tool_profile_callback("build")
+                session_runtime.exit_plan_mode()
                 console.print(
                     "[yellow]Plan ready for review. Use /plan apply to execute it or /plan exit to leave planning mode.[/yellow]"
                 )
                 return
 
             if decision:
-                approved_plan = mark_plan_approved(session_context)
-                session_context.set_session_mode("build")
-                set_tool_profile_callback("build")
-                if logger is not None:
-                    logger.log_plan_event(
-                        turn_id=None,
-                        stage="approved",
-                        plan_id=approved_plan.plan_id,
-                        status=approved_plan.status,
-                        file_path=approved_plan.file_path,
-                    )
-                executing_plan = mark_plan_executing(session_context)
-                if logger is not None:
-                    logger.log_plan_event(
-                        turn_id=None,
-                        stage="execution_started",
-                        plan_id=executing_plan.plan_id,
-                        status=executing_plan.status,
-                        file_path=executing_plan.file_path,
-                    )
+                executing_plan, execution_message = session_runtime.prepare_current_plan_for_execution()
                 console.print("[green]Plan accepted. Executing the approved plan.[/green]")
-                run_agent_turn_callback(build_plan_execution_message(executing_plan))
+                run_agent_turn_callback(execution_message)
                 return
 
-            rejected_plan = mark_plan_rejected(session_context)
-            session_context.set_session_mode("build")
-            set_tool_profile_callback("build")
-            if logger is not None:
-                logger.log_plan_event(
-                    turn_id=None,
-                    stage="rejected",
-                    plan_id=rejected_plan.plan_id,
-                    status=rejected_plan.status,
-                    file_path=rejected_plan.file_path,
-                )
+            session_runtime.mark_current_plan_rejected()
+            session_runtime.exit_plan_mode()
             console.print("[yellow]Plan rejected. Returned to build mode.[/yellow]")
             return
 
@@ -783,37 +724,13 @@ def register_all(registry):
                 )
                 return
 
-            approved_plan = current_plan
-            logger = getattr(agent, "logger", None)
-            if session_context.active_approved_plan_id != current_plan.plan_id:
-                approved_plan = mark_plan_approved(session_context)
-                if logger is not None:
-                    logger.log_plan_event(
-                        turn_id=None,
-                        stage="approved",
-                        plan_id=approved_plan.plan_id,
-                        status=approved_plan.status,
-                        file_path=approved_plan.file_path,
-                    )
-
-            executing_plan = mark_plan_executing(session_context)
-            session_context.set_session_mode("build")
-            set_tool_profile_callback("build")
-            if logger is not None:
-                logger.log_plan_event(
-                    turn_id=None,
-                    stage="execution_started",
-                    plan_id=executing_plan.plan_id,
-                    status=executing_plan.status,
-                    file_path=executing_plan.file_path,
-                )
+            executing_plan, execution_message = session_runtime.prepare_current_plan_for_execution()
             console.print("[green]Executing the approved session plan.[/green]")
-            run_agent_turn_callback(build_plan_execution_message(executing_plan))
+            run_agent_turn_callback(execution_message)
             return
 
         if subcommand == "exit":
-            session_context.set_session_mode("build")
-            set_tool_profile_callback("build")
+            session_runtime.exit_plan_mode()
             console.print("[yellow]Returned to build mode.[/yellow]")
             return
 
@@ -821,17 +738,7 @@ def register_all(registry):
             if current_plan is None or session_context.active_approved_plan_id is None:
                 console.print("[yellow]No active approved plan contract to clear[/yellow]")
                 return
-            cleared_plan_id = session_context.active_approved_plan_id
-            session_context.clear_active_plan_contract()
-            logger = getattr(agent, "logger", None)
-            if logger is not None:
-                logger.log_plan_event(
-                    turn_id=None,
-                    stage="cleared",
-                    plan_id=cleared_plan_id,
-                    status=current_plan.status,
-                    file_path=current_plan.file_path,
-                )
+            session_runtime.clear_active_plan_contract()
             console.print("[yellow]Cleared the active approved plan contract for this session.[/yellow]")
             return
 

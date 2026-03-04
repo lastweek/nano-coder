@@ -2,11 +2,9 @@
 
 from dataclasses import dataclass
 import json
-from time import perf_counter
-from typing import Callable, Optional, List, Dict, Tuple, Any, Literal
+from typing import Callable, Optional, List, Dict, Any, Literal, Tuple
 from src.activity_preview import (
     build_assistant_preview,
-    build_tool_result_preview,
     build_tool_signature,
 )
 from src.plan_mode import build_build_execution_contract, build_plan_prompt
@@ -19,16 +17,8 @@ from src.logger import SessionLogger
 from src.metrics import LLMMetrics
 from src.config import Config
 from src.context_compaction import ContextCompactionManager, ContextCompactionPolicy
+from src.tool_runtime import AgentToolRuntime, ToolBatchOutcome
 from src.turn_activity import TurnActivityCallback, TurnActivityEvent
-
-
-@dataclass(frozen=True)
-class _SubagentToolCallResolution:
-    """One resolved run_subagent tool call in original batch order."""
-
-    tool_call_id: str
-    request: Any | None = None
-    error_payload: Dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -38,14 +28,6 @@ class _ModelIterationResult:
     outcome: Literal["final_answer", "tool_calls"]
     assistant_text: str
     requested_tool_calls: List[Dict[str, Any]]
-
-
-@dataclass(frozen=True)
-class _ToolProcessingResult:
-    """Outcome of processing one model-issued tool-call batch."""
-
-    processed_count: int
-    terminal_response: str | None = None
 
 
 @dataclass
@@ -118,6 +100,17 @@ class Agent:
         )
         self._cached_tool_schemas = None
         self._skill_event_callback = None
+        self.tool_runtime = AgentToolRuntime(
+            parent_agent=self,
+            context=self.context,
+            logger=self.logger,
+            subagent_manager=self.subagent_manager,
+            get_tool=lambda name: self.tools.get(name),
+            build_tool_result_message=self._build_tool_result_message,
+            parse_tool_arguments_for_logging=self._parse_tool_arguments_for_logging,
+            emit_turn_event=self._emit_turn_event,
+            emit_skill_event=self._emit_skill_event,
+        )
         self._refresh_system_prompt_base()
 
     def set_skill_event_callback(self, callback: Optional[Callable]) -> None:
@@ -583,376 +576,6 @@ Be concise and helpful."""
             return arguments
         return {"value": arguments}
 
-    def _execute_standard_tool_call(self, tool_call: Dict, parsed_args: Dict) -> Tuple[Dict, Dict]:
-        """Execute a single tool call.
-
-        Args:
-            tool_call: Tool call dict with id, name, and arguments
-            parsed_args: Pre-parsed tool arguments
-
-        Returns:
-            Tuple of (tool result message for LLM, parsed result dict)
-        """
-        tool_name = tool_call["name"]
-        tool_id = tool_call["id"]
-
-        try:
-            # Get tool and execute
-            tool = self.tools.get(tool_name)
-            if not tool:
-                result = {"error": f"Unknown tool: {tool_name}"}
-            else:
-                result_obj = tool.execute(self.context, **parsed_args)
-                if result_obj.success:
-                    result = {"output": str(result_obj.data)}
-                else:
-                    result = {"error": result_obj.error or "Tool execution failed"}
-
-        except json.JSONDecodeError:
-            result = {"error": f"Invalid JSON in tool arguments: {tool_call['arguments']}"}
-        except Exception as e:
-            result = {"error": f"Error executing tool: {e}"}
-
-        return self._build_tool_result_message(tool_id, result), result
-
-    def _execute_submit_plan_tool(
-        self,
-        tool_call: Dict[str, Any],
-        parsed_args: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Execute submit_plan and return the raw control-plane payload."""
-        tool = self.tools.get("submit_plan")
-        if tool is None:
-            return {"error": "submit_plan is not available in the current tool profile"}
-
-        result_obj = tool.execute(self.context, **parsed_args)
-        if not result_obj.success:
-            return {"error": result_obj.error or "submit_plan failed"}
-
-        if isinstance(result_obj.data, dict):
-            return result_obj.data
-        return {
-            "summary": str(result_obj.data or ""),
-            "report": str(result_obj.data or ""),
-        }
-
-    def _process_subagent_tool_batch(
-        self,
-        tool_calls: List[Dict],
-        messages: List[Dict],
-        turn_id: int,
-        iteration: int,
-        on_tool_call: Optional[Callable],
-        on_event: Optional[TurnActivityCallback],
-        tools_used: Optional[List[str]],
-    ) -> int:
-        """Process one consecutive run_subagent batch with per-turn-capped fan-out."""
-        resolved_tool_calls: List[_SubagentToolCallResolution] = []
-
-        for tool_call in tool_calls:
-            logging_arguments = self._parse_tool_arguments_for_logging(tool_call["arguments"])
-            tool_call_id = tool_call["id"]
-            if on_tool_call is not None:
-                on_tool_call("run_subagent", logging_arguments)
-
-            self.logger.log_tool_call(
-                turn_id=turn_id,
-                iteration=iteration,
-                tool_name="run_subagent",
-                arguments=logging_arguments,
-                tool_call_id=tool_call_id,
-            )
-
-            if tools_used is not None and "run_subagent" not in tools_used:
-                tools_used.append("run_subagent")
-
-            if self.subagent_manager is None:
-                resolved_tool_calls.append(
-                    _SubagentToolCallResolution(
-                        tool_call_id=tool_call_id,
-                        error_payload={"error": "Subagent runtime is not available"},
-                    )
-                )
-                continue
-
-            try:
-                arguments = json.loads(tool_call["arguments"])
-            except json.JSONDecodeError as exc:
-                resolved_tool_calls.append(
-                    _SubagentToolCallResolution(
-                        tool_call_id=tool_call_id,
-                        error_payload={"error": f"Invalid JSON in tool arguments: {exc}"},
-                    )
-                )
-                continue
-
-            if not isinstance(arguments, dict):
-                resolved_tool_calls.append(
-                    _SubagentToolCallResolution(
-                        tool_call_id=tool_call_id,
-                        error_payload={"error": "Tool arguments must decode to a JSON object"},
-                    )
-                )
-                continue
-
-            try:
-                request = self.subagent_manager.build_subagent_request(arguments)
-            except ValueError as exc:
-                resolved_tool_calls.append(
-                    _SubagentToolCallResolution(
-                        tool_call_id=tool_call_id,
-                        error_payload={"error": str(exc)},
-                    )
-                )
-                continue
-
-            resolved_tool_calls.append(
-                _SubagentToolCallResolution(
-                    tool_call_id=tool_call_id,
-                    request=request,
-                )
-            )
-
-        valid_requests = [
-            resolved_tool_call.request
-            for resolved_tool_call in resolved_tool_calls
-            if resolved_tool_call.request is not None
-        ]
-        subagent_results: List[Any] = []
-        if self.subagent_manager is not None and valid_requests:
-            subagent_results = self.subagent_manager.run_subagents(
-                self,
-                valid_requests,
-                parent_turn_id=turn_id,
-                on_event=on_event,
-            )
-        subagent_results_iter = iter(subagent_results)
-
-        for resolved_tool_call in resolved_tool_calls:
-            result_payload = (
-                resolved_tool_call.error_payload
-                if resolved_tool_call.error_payload is not None
-                else next(subagent_results_iter).to_payload()
-            )
-            messages.append(
-                self._build_tool_result_message(
-                    resolved_tool_call.tool_call_id,
-                    result_payload,
-                )
-            )
-            self.logger.log_tool_result(
-                turn_id=turn_id,
-                iteration=iteration,
-                tool_name="run_subagent",
-                result=result_payload,
-                tool_call_id=resolved_tool_call.tool_call_id,
-            )
-
-        return len(tool_calls)
-
-    def _process_tool_calls(
-        self,
-        tool_calls: List[Dict],
-        messages: List[Dict],
-        turn_id: int,
-        iteration: int,
-        on_tool_call: Optional[Callable] = None,
-        on_event: Optional[TurnActivityCallback] = None,
-        tools_used: Optional[List[str]] = None,
-        skills_used: Optional[List[str]] = None,
-    ) -> _ToolProcessingResult:
-        """Process multiple tool calls and add results to messages.
-
-        Args:
-            tool_calls: List of tool call dicts
-            messages: Message list to append results to
-            on_tool_call: Optional callback for notification
-        """
-        processed_count = 0
-        index = 0
-        while index < len(tool_calls):
-            current_tool_call = tool_calls[index]
-            parsed_args = json.loads(current_tool_call["arguments"])
-            tool_name = current_tool_call["name"]
-            tool_call_id = current_tool_call["id"]
-
-            if tool_name == "run_subagent":
-                subagent_batch: List[Dict[str, Any]] = []
-                while index < len(tool_calls) and tool_calls[index]["name"] == "run_subagent":
-                    subagent_batch.append(tool_calls[index])
-                    index += 1
-                processed_count += self._process_subagent_tool_batch(
-                    subagent_batch,
-                    messages,
-                    turn_id,
-                    iteration,
-                    on_tool_call,
-                    on_event,
-                    tools_used,
-                )
-                continue
-
-            processed_count += 1
-            if tools_used is not None and tool_name not in tools_used:
-                tools_used.append(tool_name)
-
-            if tool_name == "load_skill":
-                self._emit_skill_event(
-                    turn_id,
-                    "tool_load_requested",
-                    skill_name=parsed_args.get("skill_name"),
-                    iteration=iteration,
-                )
-                self._emit_turn_event(
-                    on_event,
-                    "skill_load_requested",
-                    iteration=iteration,
-                    skill_name=parsed_args.get("skill_name"),
-                )
-
-            if on_tool_call:
-                on_tool_call(tool_name, parsed_args)
-
-            self._emit_turn_event(
-                on_event,
-                "tool_call_started",
-                iteration=iteration,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                arguments=parsed_args,
-            )
-            started_at = perf_counter()
-
-            self.logger.log_tool_call(
-                turn_id=turn_id,
-                iteration=iteration,
-                tool_name=tool_name,
-                arguments=parsed_args,
-                tool_call_id=tool_call_id,
-            )
-
-            if tool_name == "submit_plan":
-                result_content = self._execute_submit_plan_tool(current_tool_call, parsed_args)
-                self.logger.log_tool_result(
-                    turn_id=turn_id,
-                    iteration=iteration,
-                    tool_name=tool_name,
-                    result=result_content,
-                    tool_call_id=tool_call_id,
-                )
-                result_preview, result_body = build_tool_result_preview(tool_name, result_content)
-                self._emit_turn_event(
-                    on_event,
-                    "tool_call_finished",
-                    iteration=iteration,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                    arguments=parsed_args,
-                    success="error" not in result_content,
-                    duration_s=0.0,
-                    error=result_content.get("error"),
-                    result_preview=result_preview,
-                    result_body=result_body,
-                )
-                if "error" in result_content:
-                    messages.append(self._build_tool_result_message(tool_call_id, result_content))
-                    index += 1
-                    continue
-
-                submitted_plan = self.context.get_current_plan()
-                submitted_report = (
-                    submitted_plan.report
-                    if submitted_plan is not None and submitted_plan.report
-                    else str(result_content.get("report", ""))
-                )
-                submitted_summary = (
-                    submitted_plan.summary
-                    if submitted_plan is not None and submitted_plan.summary
-                    else str(result_content.get("summary", ""))
-                )
-                self.logger.log_plan_event(
-                    turn_id=turn_id,
-                    stage="submitted",
-                    plan_id=submitted_plan.plan_id if submitted_plan is not None else None,
-                    status=submitted_plan.status if submitted_plan is not None else "ready_for_review",
-                    file_path=submitted_plan.file_path if submitted_plan is not None else None,
-                    summary=submitted_summary,
-                )
-                self._emit_turn_event(
-                    on_event,
-                    "plan_submitted",
-                    iteration=iteration,
-                    summary=submitted_summary,
-                    plan_id=submitted_plan.plan_id if submitted_plan is not None else None,
-                    file_path=submitted_plan.file_path if submitted_plan is not None else None,
-                )
-                return _ToolProcessingResult(
-                    processed_count=processed_count,
-                    terminal_response=submitted_report,
-                )
-
-            tool_result_message, result_content = self._execute_standard_tool_call(current_tool_call, parsed_args)
-            messages.append(tool_result_message)
-            duration_s = perf_counter() - started_at
-
-            self.logger.log_tool_result(
-                turn_id=turn_id,
-                iteration=iteration,
-                tool_name=tool_name,
-                result=result_content,
-                tool_call_id=tool_call_id,
-            )
-            result_preview, result_body = build_tool_result_preview(tool_name, result_content)
-            self._emit_turn_event(
-                on_event,
-                "tool_call_finished",
-                iteration=iteration,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                arguments=parsed_args,
-                success="error" not in result_content,
-                duration_s=duration_s,
-                error=result_content.get("error"),
-                result_preview=result_preview,
-                result_body=result_body,
-            )
-            if tool_name == "load_skill":
-                skill_event_name = "tool_load_succeeded"
-                cli_event_name = "skill_load_succeeded"
-                event_details = {
-                    "skill_name": parsed_args.get("skill_name"),
-                    "iteration": iteration,
-                }
-                if "error" in result_content:
-                    skill_event_name = "tool_load_failed"
-                    cli_event_name = "skill_load_failed"
-                    event_details["error"] = result_content["error"]
-                elif skills_used is not None:
-                    skill_name = parsed_args.get("skill_name")
-                    if skill_name and skill_name not in skills_used:
-                        skills_used.append(skill_name)
-                self._emit_skill_event(turn_id, skill_event_name, **event_details)
-                cli_details = {key: value for key, value in event_details.items() if key != "iteration"}
-                self._emit_turn_event(on_event, cli_event_name, iteration=iteration, **cli_details)
-            if tool_name == "write_plan" and "error" not in result_content:
-                current_plan = self.context.get_current_plan()
-                self.logger.log_plan_event(
-                    turn_id=turn_id,
-                    stage="written",
-                    plan_id=current_plan.plan_id if current_plan is not None else None,
-                    status=current_plan.status if current_plan is not None else "draft",
-                    file_path=current_plan.file_path if current_plan is not None else None,
-                )
-                self._emit_turn_event(
-                    on_event,
-                    "plan_written",
-                    iteration=iteration,
-                    plan_id=current_plan.plan_id if current_plan is not None else None,
-                    file_path=current_plan.file_path if current_plan is not None else None,
-                )
-            index += 1
-        return _ToolProcessingResult(processed_count=processed_count)
-
     def _append_completed_turn_to_context(self, user_message: str, final_response: str) -> None:
         """Save and log final agent response.
 
@@ -1268,15 +891,15 @@ Be concise and helpful."""
                     turn_state.is_finished = True
                     return final_response
 
-                tool_processing_result = self._process_tool_calls(
+                tool_processing_result = self.tool_runtime.process_tool_calls(
                     model_iteration.requested_tool_calls,
-                    turn_state.conversation_messages,
-                    turn_state.turn_id,
-                    iteration,
-                    on_tool_call,
-                    on_event,
-                    turn_state.tools_used,
-                    turn_state.skills_used,
+                    messages=turn_state.conversation_messages,
+                    turn_id=turn_state.turn_id,
+                    iteration=iteration,
+                    on_tool_call=on_tool_call,
+                    on_event=on_event,
+                    tools_used=turn_state.tools_used,
+                    skills_used=turn_state.skills_used,
                 )
                 turn_state.tool_call_count += tool_processing_result.processed_count
                 if tool_processing_result.terminal_response is not None:
@@ -1332,6 +955,29 @@ Be concise and helpful."""
                 next(turn_runner)
             except StopIteration as stop:
                 return stop.value
+
+    def _process_tool_calls(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        messages: List[Dict[str, Any]],
+        turn_id: int,
+        iteration: int,
+        on_tool_call: Optional[Callable] = None,
+        on_event: Optional[TurnActivityCallback] = None,
+        tools_used: Optional[List[str]] = None,
+        skills_used: Optional[List[str]] = None,
+    ) -> ToolBatchOutcome:
+        """Compatibility wrapper around the extracted tool runtime."""
+        return self.tool_runtime.process_tool_calls(
+            tool_calls,
+            messages=messages,
+            turn_id=turn_id,
+            iteration=iteration,
+            on_tool_call=on_tool_call,
+            on_event=on_event,
+            tools_used=tools_used,
+            skills_used=skills_used,
+        )
 
     def run(
         self,

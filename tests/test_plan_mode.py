@@ -21,9 +21,10 @@ from src.plan_mode import (
     mark_plan_approved,
     write_plan_content,
 )
+from src.session_runtime import SessionRuntimeController
 from src.skills import SkillManager
 from src.subagents import SubagentManager
-from src.tools import build_tool_registry
+from src.tools import ToolProfile, build_tool_registry
 from src.tools.plan_submit import SubmitPlanTool
 from src.tools.plan_write import WritePlanTool
 from src.tools.readonly_shell import ReadOnlyShellTool
@@ -67,7 +68,7 @@ def create_plan_command_context(temp_dir, *, prompt_answers=None):
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
         include_subagent_tool=True,
-        tool_profile="build",
+        tool_profile=ToolProfile.BUILD,
     )
     agent = Agent(
         DummyParentLLM(),
@@ -78,11 +79,18 @@ def create_plan_command_context(temp_dir, *, prompt_answers=None):
     )
     agent.logger.enabled = False
 
-    profile_changes: list[str] = []
+    profile_changes: list[ToolProfile] = []
     turn_prompts: list[str] = []
     answers = list(prompt_answers or [])
 
-    def set_tool_profile(tool_profile: str) -> None:
+    command_context = {
+        "agent": agent,
+        "session_context": session_context,
+        "skill_manager": skill_manager,
+        "subagent_manager": subagent_manager,
+    }
+
+    def apply_tool_profile(tool_profile: ToolProfile) -> None:
         profile_changes.append(tool_profile)
         rebuilt_tools = build_tool_registry(
             skill_manager=skill_manager,
@@ -91,6 +99,16 @@ def create_plan_command_context(temp_dir, *, prompt_answers=None):
             tool_profile=tool_profile,
         )
         agent.set_tool_registry(rebuilt_tools)
+        command_context["tools"] = rebuilt_tools
+
+    session_runtime = SessionRuntimeController(
+        session_context=session_context,
+        agent=agent,
+        skill_manager=skill_manager,
+        subagent_manager=subagent_manager,
+        apply_tool_profile=apply_tool_profile,
+        logger=agent.logger,
+    )
 
     def run_agent_turn_callback(prompt: str) -> str:
         turn_prompts.append(prompt)
@@ -116,12 +134,9 @@ def create_plan_command_context(temp_dir, *, prompt_answers=None):
     return (
         registry,
         {
-            "agent": agent,
-            "session_context": session_context,
-            "skill_manager": skill_manager,
-            "subagent_manager": subagent_manager,
+            **command_context,
+            "session_runtime_controller": session_runtime,
             "run_agent_turn_callback": run_agent_turn_callback,
-            "set_tool_profile_callback": set_tool_profile,
             "prompt_input_callback": prompt_input_callback if prompt_answers is not None else None,
         },
         profile_changes,
@@ -144,19 +159,19 @@ def test_build_tool_registry_uses_plan_safe_profiles(monkeypatch, temp_dir):
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
         include_subagent_tool=True,
-        tool_profile="build",
+        tool_profile=ToolProfile.BUILD,
     )
     plan_main_tools = build_tool_registry(
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
         include_subagent_tool=True,
-        tool_profile="plan_main",
+        tool_profile=ToolProfile.PLAN_MAIN,
     )
     plan_subagent_tools = build_tool_registry(
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
         include_subagent_tool=False,
-        tool_profile="plan_subagent",
+        tool_profile=ToolProfile.PLAN_SUBAGENT,
     )
 
     assert {"read_file", "write_file", "run_command", "load_skill", "run_subagent"} <= set(build_tools.list_tools())
@@ -252,7 +267,7 @@ def test_plan_start_accepts_and_executes_immediately(monkeypatch, temp_dir):
     assert current_plan is not None
     assert session_context.active_approved_plan_id == current_plan.plan_id
     assert current_plan.status == "executing"
-    assert profile_changes == ["plan_main", "build"]
+    assert profile_changes == [ToolProfile.PLAN_MAIN, ToolProfile.BUILD]
     assert len(turn_prompts) == 2
     assert "Execute the approved plan" in turn_prompts[1]
 
@@ -277,7 +292,7 @@ def test_plan_start_rejects_and_returns_to_build_mode(monkeypatch, temp_dir):
     assert current_plan is not None
     assert current_plan.status == "rejected"
     assert session_context.active_approved_plan_id is None
-    assert profile_changes == ["plan_main", "build"]
+    assert profile_changes == [ToolProfile.PLAN_MAIN, ToolProfile.BUILD]
     assert len(turn_prompts) == 1
 
 
@@ -305,7 +320,7 @@ def test_plan_apply_executes_ready_plan(monkeypatch, temp_dir):
     assert current_plan is not None
     assert current_plan.status == "executing"
     assert session_context.active_approved_plan_id == current_plan.plan_id
-    assert profile_changes == ["build"]
+    assert profile_changes == [ToolProfile.BUILD]
     assert len(turn_prompts) == 1
     assert "Execute the approved plan" in turn_prompts[0]
 
@@ -328,7 +343,7 @@ def test_plan_mode_subagent_children_inherit_read_only_tools(monkeypatch, temp_d
         skill_manager=skill_manager,
         subagent_manager=subagent_manager,
         include_subagent_tool=True,
-        tool_profile="plan_main",
+        tool_profile=ToolProfile.PLAN_MAIN,
     )
     parent_agent = Agent(
         DummyParentLLM(),

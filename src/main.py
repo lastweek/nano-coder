@@ -1,7 +1,9 @@
 """Main CLI entry point for Nano-Coder."""
 
 import os
+import random
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -10,7 +12,7 @@ if __name__ == "__main__" and __file__:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
-from rich.console import Console
+from rich.console import Console, Group
 from src.input_helper import InputHelper
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -20,8 +22,8 @@ from rich.live import Live
 from src.context import Context
 from src.llm import LLMClient
 from src.metrics import LLMMetrics
-from src.plan_mode import create_session_plan
-from src.tools import build_tool_registry
+from src.session_runtime import SessionRuntimeController
+from src.tools import ToolProfile, build_tool_registry
 from src.agent import Agent
 from src.config import config
 from src.mcp import MCPManager
@@ -32,16 +34,115 @@ from src.statusline import build_prompt_toolbar
 from src.turn_display import TurnProgressDisplay
 from src.turn_controls import LiveTurnControls
 from src.subagents import SubagentManager
+from src.utils import env_truthy
 
 REQUEST_TYPE_STREAMING = "streaming"
 REQUEST_TYPE_NON_STREAMING = "non-streaming"
-DEBUG_ENABLED_VALUES = ("1", "true", "yes")
 NANO_CODER_WORDMARK = r""" _   _                        ____          _
 | \ | | __ _ _ __   ___      / ___|___   __| | ___ _ __
 |  \| |/ _` | '_ \ / _ \____| |   / _ \ / _` |/ _ \ '__|
 | |\  | (_| | | | | (_) |____| |__| (_) | (_| |  __/ |
 |_| \_|\__,_|_| |_|\___/      \____\___/ \__,_|\___|_|
 """
+FIRE_CHARACTERS = " .,:;irsXA253hMHGS#9B&@"
+FIRE_COLORS = (
+    "#3a281f",
+    "#5b3521",
+    "#7d4823",
+    "#9f5b25",
+    "#c06f28",
+    "#d98a3a",
+    "#e5a95f",
+    "#f1c98c",
+)
+
+
+def _build_banner_panel(llm_info_lines: list[Text], *, fire_text: Text | None = None) -> Panel:
+    """Build the startup banner panel, optionally with one fire frame."""
+    renderables = [
+        Text(NANO_CODER_WORDMARK.rstrip("\n"), style="bold cyan"),
+    ]
+    if fire_text is not None:
+        renderables.append(fire_text)
+    renderables.append(Text("Minimalism Terminal Code Agent", style="dim"))
+
+    if llm_info_lines:
+        renderables.append(Text(""))
+        renderables.append(Text("\n").join(llm_info_lines))
+
+    return Panel(
+        Group(*renderables),
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+
+def _update_fire_heat(heat: list[list[float]], rng: random.Random) -> list[list[float]]:
+    """Generate the next banner fire frame."""
+    height = len(heat)
+    width = len(heat[0]) if heat else 0
+    next_heat = [[0.0 for _ in range(width)] for _ in range(height)]
+
+    for x in range(width):
+        if rng.random() < 0.72:
+            next_heat[-1][x] = rng.uniform(0.48, 1.0)
+        else:
+            next_heat[-1][x] = heat[-1][x] * 0.35
+
+    for y in range(height - 2, -1, -1):
+        for x in range(width):
+            source_x = min(width - 1, max(0, x + rng.choice((-1, 0, 1))))
+            inherited = (next_heat[y + 1][x] + next_heat[y + 1][source_x]) / 2
+            cooling = rng.uniform(0.05, 0.18)
+            next_heat[y][x] = max(0.0, inherited - cooling)
+
+    return next_heat
+
+
+def _render_fire_frame(heat: list[list[float]], rng: random.Random) -> Text:
+    """Render one original ASCII fire frame."""
+    fire_text = Text()
+    max_index = len(FIRE_CHARACTERS) - 1
+    color_count = len(FIRE_COLORS)
+
+    for row_index, row in enumerate(heat):
+        for cell in row:
+            intensity = max(0.0, min(1.0, cell))
+            char_index = min(max_index, int(intensity * max_index))
+            character = FIRE_CHARACTERS[char_index]
+            if character == " " and intensity > 0.16 and rng.random() < 0.08:
+                character = "."
+            color_index = min(color_count - 1, int(intensity * (color_count - 1)))
+            fire_text.append(character, style=FIRE_COLORS[color_index])
+        if row_index != len(heat) - 1:
+            fire_text.append("\n")
+
+    return fire_text
+
+
+def _animate_banner_fire(console: Console, llm_info_lines: list[Text]) -> None:
+    """Show a brief original ASCII fire animation before the static banner."""
+    width = max(len(line) for line in NANO_CODER_WORDMARK.splitlines())
+    height = 6
+    rng = random.Random()
+    heat = [[0.0 for _ in range(width)] for _ in range(height)]
+
+    with Live(
+        _build_banner_panel(llm_info_lines),
+        console=console,
+        transient=True,
+        auto_refresh=False,
+    ) as live:
+        for _ in range(12):
+            heat = _update_fire_heat(heat, rng)
+            live.update(
+                _build_banner_panel(
+                    llm_info_lines,
+                    fire_text=_render_fire_frame(heat, rng),
+                ),
+                refresh=True,
+            )
+            time.sleep(0.08)
 
 
 def print_banner(console: Console) -> None:
@@ -60,21 +161,10 @@ def print_banner(console: Console) -> None:
     if config.llm.provider:
         llm_info_lines.append(Text(f"Provider: {config.llm.provider}", style="dim"))
 
-    # Build panel content
-    panel_content = Text(NANO_CODER_WORDMARK.rstrip("\n"), style="bold cyan")
-    panel_content.append("\n")
-    panel_content.append("Minimalism Terminal Code Agent", style="dim")
+    if console.is_terminal:
+        _animate_banner_fire(console, llm_info_lines)
 
-    # Add LLM info if available
-    if llm_info_lines:
-        panel_content += Text("\n\n")
-        panel_content += Text("\n").join(llm_info_lines)
-
-    console.print(Panel(
-        panel_content,
-        border_style="cyan",
-        padding=(1, 2)
-    ))
+    console.print(_build_banner_panel(llm_info_lines))
     console.print("[dim]Type 'exit' or 'quit' to leave[/dim]\n")
 
 
@@ -232,7 +322,7 @@ def main() -> None:
     # Load configuration
     enable_streaming = config.ui.enable_streaming
     provider = config.llm.provider
-    skill_debug = os.environ.get("SKILL_DEBUG", "").lower() in DEBUG_ENABLED_VALUES
+    skill_debug = env_truthy("SKILL_DEBUG")
 
     # Use stderr for Rich output to avoid conflicts with prompt_toolkit using stdout
     import sys
@@ -287,7 +377,7 @@ def main() -> None:
     if config.mcp.servers:
         try:
             # Enable MCP debug mode via environment variable
-            mcp_debug = os.environ.get("MCP_DEBUG", "").lower() in ("1", "true", "yes")
+            mcp_debug = env_truthy("MCP_DEBUG")
 
             if mcp_debug:
                 console.print("[dim][MCP] Debug mode enabled[/dim]")
@@ -328,7 +418,7 @@ def main() -> None:
         mcp_manager=mcp_manager,
         subagent_manager=subagent_manager,
         include_subagent_tool=config.subagents.enabled,
-        tool_profile="build",
+        tool_profile=ToolProfile.BUILD,
     )
 
     # Create agent
@@ -344,7 +434,7 @@ def main() -> None:
     registry = CommandRegistry()
     builtin.register_all(registry)
 
-    def set_tool_profile_callback(tool_profile: str) -> None:
+    def apply_tool_profile(tool_profile: ToolProfile) -> None:
         """Rebuild the parent tool registry for the requested session tool profile."""
         rebuilt_tools = build_tool_registry(
             skill_manager=skill_manager,
@@ -365,6 +455,16 @@ def main() -> None:
         "session_context": context,
         "subagent_manager": subagent_manager,
     }
+    session_runtime = SessionRuntimeController(
+        session_context=context,
+        agent=agent,
+        skill_manager=skill_manager,
+        mcp_manager=mcp_manager,
+        subagent_manager=subagent_manager,
+        apply_tool_profile=apply_tool_profile,
+        logger=agent.logger,
+    )
+    cmd_context["session_runtime_controller"] = session_runtime
 
     # Extract command descriptions for completer
     command_descriptions = {}
@@ -379,27 +479,11 @@ def main() -> None:
         return build_prompt_toolbar(
             context,
             view_mode=config.ui.live_activity_mode,
-            detail_mode=config.ui.live_activity_details,
         )
 
     def toggle_plan_mode() -> None:
         """Toggle the top-level session mode between build and plan."""
-        if not config.plan.enabled:
-            return
-
-        if context.get_session_mode() == "plan":
-            context.set_session_mode("build")
-            set_tool_profile_callback("build")
-            return
-
-        if context.get_current_plan() is None:
-            create_session_plan(
-                context,
-                task="Interactive planning session",
-                plan_dir=config.plan.plan_dir,
-            )
-        context.set_session_mode("plan")
-        set_tool_profile_callback("plan_main")
+        session_runtime.toggle_plan_mode()
 
     # Initialize input helper for bash-like editing with command completion
     input_helper = InputHelper(
@@ -411,7 +495,6 @@ def main() -> None:
     )
     cmd_context["input_helper"] = input_helper
     cmd_context["prompt_input_callback"] = input_helper.get_input
-    cmd_context["set_tool_profile_callback"] = set_tool_profile_callback
     cmd_context["run_agent_turn_callback"] = lambda prompt: execute_user_turn(
         console,
         agent,

@@ -137,13 +137,6 @@ class TurnProgressDisplay:
         with self._lock:
             self.live_state.mode = "verbose" if self.live_state.mode == "simple" else "simple"
 
-    def toggle_detail_mode(self) -> None:
-        """Toggle collapsed/expanded entry bodies."""
-        with self._lock:
-            self.live_state.detail_mode = (
-                "expanded" if self.live_state.detail_mode == "collapsed" else "collapsed"
-            )
-
     def toggle_controls_hint(self) -> None:
         """Toggle the controls hint footer."""
         with self._lock:
@@ -162,14 +155,13 @@ class TurnProgressDisplay:
 
             if self.live_state.show_controls_hint:
                 renderables.append(
-                    Text("v: simple/verbose  z: fold/unfold  ?: controls", style="dim")
+                    Text("v: simple/verbose  ?: controls", style="dim")
                 )
             if self.session_context is not None:
                 renderables.append(
                     build_rich_statusline(
                         self.session_context,
                         view_mode=self.live_state.mode,
-                        detail_mode=self.live_state.detail_mode,
                     )
                 )
             elif renderables:

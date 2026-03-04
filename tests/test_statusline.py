@@ -13,10 +13,9 @@ def test_build_statusline_text_for_default_build_session():
     text = build_statusline_text(
         context,
         view_mode="simple",
-        detail_mode="collapsed",
     )
 
-    assert text == "BUILD | view:simple | details:collapsed | plan:none | tip:Shift+Tab plan mode"
+    assert text == "BUILD | view:simple | plan:none | tip:Shift+Tab plan mode"
 
 
 def test_build_statusline_text_reflects_ready_plan_and_active_contract():
@@ -41,12 +40,11 @@ def test_build_statusline_text_reflects_ready_plan_and_active_contract():
     text = build_statusline_text(
         context,
         view_mode="verbose",
-        detail_mode="expanded",
     )
 
     assert (
         text
-        == "PLAN | view:verbose | details:expanded | plan:ready | contract:on | "
+        == "PLAN | view:verbose | plan:ready | contract:on | "
         "tip:Shift+Tab build mode | /plan apply"
     )
 
@@ -60,13 +58,12 @@ def test_build_rich_statusline_exports_plain_text():
         build_rich_statusline(
             context,
             view_mode="simple",
-            detail_mode="collapsed",
         )
     )
 
     assert (
         console.export_text().strip()
-        == "BUILD | view:simple | details:collapsed | plan:none | tip:Shift+Tab plan mode"
+        == "BUILD | view:simple | plan:none | tip:Shift+Tab plan mode"
     )
 
 
@@ -91,11 +88,10 @@ def test_build_statusline_text_reflects_active_contract_in_build_mode():
     text = build_statusline_text(
         context,
         view_mode="simple",
-        detail_mode="collapsed",
     )
 
     assert (
         text
-        == "BUILD | view:simple | details:collapsed | plan:executing | contract:on | "
+        == "BUILD | view:simple | plan:executing | contract:on | "
         "tip:Shift+Tab plan mode | /plan clear"
     )

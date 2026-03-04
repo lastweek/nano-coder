@@ -17,11 +17,18 @@ from src.tools import (
     REQUEST_KIND_CONTEXT_COMPACTION,
     REQUEST_KIND_PLAN_TURN,
 )
+from src.utils import env_truthy
 
 
+# Constants for formatting and display
 SESSION_HEADER_RULE = "=" * 80
 SECTION_RULE = "-" * 80
 ARTIFACT_SPILL_THRESHOLD = 8192
+
+# ID formatting constants
+ID_PADDING_WIDTH = 4  # For step/turn numbers (:04d)
+ITERATION_PADDING_WIDTH = 2  # For iteration numbers (:02d)
+UUID_TRUNC_LENGTH = 8  # For truncating UUIDs in filenames
 
 
 def _sanitize_fragment(value: str) -> str:
@@ -79,10 +86,11 @@ class SessionLogger:
         if log_dir is None:
             log_dir = config.logging.log_dir
         if enabled is None:
+            # Check environment variable for explicit true/false
             env_value = os.environ.get("ENABLE_LOGGING", "").lower()
             if env_value == "false":
                 enabled = False
-            elif env_value == "true":
+            elif env_truthy("ENABLE_LOGGING"):
                 enabled = True
             else:
                 enabled = config.logging.enabled
@@ -106,10 +114,10 @@ class SessionLogger:
         self._timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         if self.session_kind == "subagent":
             label_fragment = _sanitize_fragment(self.subagent_label or "subagent")
-            id_fragment = _sanitize_fragment((self.subagent_id or self.session_id)[:8])
+            id_fragment = _sanitize_fragment((self.subagent_id or self.session_id)[:UUID_TRUNC_LENGTH])
             self._session_dir_name = f"subagent-{label_fragment}-{id_fragment}"
         else:
-            self._session_dir_name = f"session-{self._timestamp}-{self.session_id[:8]}"
+            self._session_dir_name = f"session-{self._timestamp}-{self.session_id[:UUID_TRUNC_LENGTH]}"
         self.session_dir: Optional[Path] = None
         self._artifacts_dir: Optional[Path] = None
         self._session_json_path: Optional[Path] = None

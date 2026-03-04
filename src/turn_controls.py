@@ -67,9 +67,6 @@ class LiveTurnControls:
         if key == "v":
             self.display.toggle_mode()
             return True
-        if key == "z":
-            self.display.toggle_detail_mode()
-            return True
         if key == "?":
             self.display.toggle_controls_hint()
             return True

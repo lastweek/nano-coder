@@ -202,4 +202,4 @@ def test_render_live_includes_statusline_footer():
 
     rendered = render_text(display.render_live())
 
-    assert "BUILD | view:verbose | details:collapsed | plan:none | tip:Shift+Tab plan mode" in rendered
+    assert "BUILD | view:verbose | plan:none | tip:Shift+Tab plan mode" in rendered
